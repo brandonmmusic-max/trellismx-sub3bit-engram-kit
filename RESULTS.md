@@ -81,6 +81,36 @@ on Uniform K2 (2.250 uniform-bit equivalent), +0.113 per-expert bpw on PE2.25
 | + Rank-16 Attention LoRA only (5.24M mergeable params) | 0.0958 | -13.4% | 0.0285 | 0.2343 | 88.76% |
 | + 8-layer Full Engram + Rank-16 Attention LoRA | 0.0945 | -14.5% | 0.0276 | 0.2329 | 88.90% |
 
+## 4b. Dual-Trellis QEC v2 ablation suite (10M fresh tokens, exact 21-window eval)
+
+Controlled 10M-token comparison testing FP32-promoted RMSNorms, zero-VRAM
+continuous codebook recalibration (`intermediate_scales_fp16` `[L, E, 3, I]`),
+per-expert output centroid bias (`3.75 MiB`), and Dual-Trellis Engram v2
+(zero-init residual bi/tri/skip tables, NFKC token canonicalization, per-order
+8-group gating, width-4 causal depthwise Conv1D, 3 shared cross-layer depth
+banks cutting host-RAM parameters 3x from 1.28B to 421M, zero embedding weight
+decay, and log-space tail-calibrated top-128 KL):
+
+| Arm (10M fresh tokens) | Base (stored bpw) | Host-RAM params | KLD @ 1M | KLD @ 5M | KLD @ 10M | vs baseline | Top-1 @ 10M |
+|---|---|---:|---:|---:|---:|---:|---:|
+| v1 Full-Stack QEC (reference) | Uniform K2 (2.00) | 1,283M | 0.1843 | 0.1527 | 0.1454 | -38.1% | 86.04% |
+| Dual-Trellis Engram v2 only + FP32 norms | Uniform K2 (2.00) | 421M | 0.1629 | 0.1493 | 0.1436 | -38.8% | 86.16% |
+| `intermediate_scales_fp16` + bias + FP32 norms | Uniform K2 (2.00) | 1,283M | 0.1642 | 0.1464 | 0.1411 | -39.9% | 86.29% |
+| **Combined Dual-Trellis QEC v2 stack** | **Uniform K2 (2.00)** | **421M** | **0.1613** | **0.1438** | **0.1384** | **-41.1%** | **86.41%** |
+| **Combined Dual-Trellis QEC v2 stack** | **Per-Expert 2.25** | **421M** | **0.0982** | **0.0937** | **0.0891** | **-19.3%** | **89.06%** |
+
+At 10M tokens, the combined Dual-Trellis QEC v2 stack on Uniform K2 (`0.1384`,
+median `0.0455`, p90 `0.3400`) beats v1's 20M-token checkpoint (`0.1390`) in
+half the tokens while using 3x less host RAM and 4x fewer host-RAM lookups. On
+Per-Expert 2.25-bit, the exact same 10M-token stack drops KLD from `0.1104` to
+`0.0891` (-19.3%, `89.06%` top-1), beating Uniform 2.50-bit (`0.1015`),
+Per-Layer 2.50-bit (`0.0975`), and Per-Expert 2.375-bit (`0.0934`). Adding a
+dense rank-64 shared-basis Wiener branch at `lr=8e-4` overfit held-out eval,
+and even with `lr=1.5e-4, wd=1e-2` plus hidden-state MSE alignment trailed the
+cleaner combined stack at 5M (`0.1453` vs `0.1438`), confirming the lean
+`intermediate_scales_fp16` + per-expert bias + Dual-Trellis Engram v2 +
+mergeable Attention LoRA + FP32 norms stack is the Pareto-optimal recipe.
+
 ## 5. Negative controls: expert deletion vs n-gram replacement
 
 Replacing deleted experts with n-gram lookup tables outperforms pure deletion
