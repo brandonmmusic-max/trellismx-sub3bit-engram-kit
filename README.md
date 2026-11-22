@@ -20,18 +20,28 @@ Target deployment envelope: fitting 1T+ parameter MoE checkpoints onto four
    UE8M0 scale refit, tail-biting Viterbi search, lossless CSF scale planes).
    YAQA-style two-sided Fisher rounding is excluded (measured 1% to 6% worse
    on Granite 3.1 3B).
-2. **Mergeable non-expert QEC (zero extra VRAM, zero extra inference latency).**
-   With all quantized MoE experts and routers permanently frozen, rank-32 LoRA
-   adapters on BF16/FP8 attention projections (`q_proj`, `k_proj`, `v_proj`,
-   `o_proj`), RMSNorm scale weights, and optional per-expert scalar gains
-   distill against top-64 teacher KL divergence. After distillation, attention
-   LoRA deltas merge algebraically into the attention weight matrices.
-3. **Host-RAM Engram QEC sidecar (zero GPU expert VRAM, O(1) deterministic prefetch).**
-   Context-gated unigram plus multi-head prime-hashed bigram and trigram lookup
-   tables attach as zero-initialized residual branches at selected layers
-   (`h + alpha(h, k) * v`). Hash addresses depend exclusively on input token
-   IDs `(t_{i-2}, t_{i-1}, t_i)`, allowing deterministic prefetch from host DDR5
-   before Layer 0 executes.
+2. **Mergeable non-expert QEC and zero-VRAM codebook recalibration.**
+   With all quantized MoE trellis indices, routers, and sparse attention
+   indexers permanently frozen, distillation trains:
+   - Existing `intermediate_scales_fp16` (`[L, E, 3, I_local]`) continuous
+     per-neuron codebook gains around SwiGLU (folds directly back into the
+     sidecar tensors for zero extra VRAM, zero extra FLOPs, and zero kernel
+     changes).
+   - Rank-32 LoRA adapters on BF16/FP8 attention projections (supporting hybrid
+     KDA/MLA topologies), optional dense prefix MLP layers, and shared experts,
+     plus FP32-promoted text-backbone RMSNorm weights (all attention/dense/shared
+     LoRA deltas merge algebraically back into base weights).
+   - Compact per-expert output centroid biases (`[L, E, H]`, ~0.0026 bpw VRAM
+     on GLM-5.3 Flash) correcting asymmetric SwiGLU Jensen drift.
+3. **Dual-Trellis Host-RAM Engram QEC sidecar (zero GPU expert VRAM, O(1) deterministic prefetch).**
+   Three shared cross-layer host-RAM depth banks (early, mid, late; 3x less
+   host RAM and 4x fewer DDR5 lookups than per-layer tables) combine raw
+   unigrams with zero-initialized residual prime-hashed bigram, trigram, and
+   skip-gram tables over NFKC-canonicalized token IDs, per-order 8-group
+   context gating with optional router-aware gating, and a width-4 causal
+   depthwise Conv1D shift-register residual. Hash addresses depend exclusively
+   on input token IDs `(t_{i-2}, t_{i-1}, t_i)`, allowing deterministic
+   prefetch from host DDR5 before Layer 0 executes.
 
 ## Repository layout
 

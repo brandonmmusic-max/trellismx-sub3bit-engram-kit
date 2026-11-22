@@ -45,10 +45,29 @@ safety, science, software engineering):
    13-gram overlap check (`<= 1%` overlap) against all evaluation windows.
 
 When the BF16 teacher exceeds local VRAM, run `scripts/dump_teacher_logits.py`
-once on a high-VRAM forward-only node to emit both the dense full-vocabulary
-evaluation windows and the sparse top-64 or top-128 distillation shards with
-exact `fp32` full-vocabulary `logsumexp` (~19.4 GB for 50M top-64 tokens,
-~38.6 GB for 50M top-128 tokens).
+once on a high-VRAM forward-only node (such as 8x H200 or 8x B200) to emit:
+
+1. Dense full-vocabulary BF16 evaluation windows (`eval_dense/`, e.g. 21
+   windows at 8K tokens plus 4 to 8 windows at 32K to 64K tokens).
+2. 50M sparse top-128 (or top-64) distillation positions split 80/20: 40M
+   tokens at 4,096 sequence length (`train_short/`) and 10M tokens at 16,384 to
+   32,768 sequence length (`train_long/`), storing shifted FP16 `top_logp`,
+   exact FP32 `p_tail`, and `logsumexp` (396 B/tok at top-64 = ~19.8 GB per 50M
+   tokens; 780 B/tok at top-128 = ~39.0 GB per 50M tokens).
+
+Example one-shot teacher logit dump command:
+
+```bash
+python3 scripts/dump_teacher_logits.py \
+  --teacher-model /path/to/bf16-teacher \
+  --eval-tokens data/eval_8k.pt data/eval_32k.pt \
+  --eval-dtype bfloat16 \
+  --short-tokens data/train_short_40m_4k.pt \
+  --long-tokens data/train_long_10m_16k.pt \
+  --topk 128 --short-batch-size 8 --long-batch-size 1 \
+  --logit-chunk-tokens 2048 --trust-remote-code --resume \
+  --output work/teacher-logits
+```
 
 ## Step 3: Stratified calibration capture and layer sensitivity
 
@@ -129,15 +148,19 @@ For large MoE models whose BF16 teacher exceeds local VRAM, omit
 `--long-teacher-shards /path/to/long_shards_dir` produced by
 `scripts/dump_teacher_logits.py`.
 
-Recommended token and bucket budgets:
+Recommended token and bucket budgets (35M to 50M base for frontier MoEs):
 
-1. Unigram-only Engram + Attention LoRA (lowest host-RAM footprint): 5M to 15M
-   tokens.
-2. Full multi-head bigram/trigram Engram + Attention LoRA: 35M to 50M tokens
-   (80% at 2K to 4K, 20% at 16K to 32K; use `262139` to `524287` prime buckets
-   per head at 35M to 50M tokens, or `1048573` to `2097143` past 100M tokens).
+1. Fast local sanity check / ablation: 10M tokens (already captures >85% of the
+   gain on 40-expert models like Granite 3.1 3B, useful for validating loss
+   curves before launching a full run).
+2. Production 288+ expert MoE (GLM-5.3 Flash, 1T+ MoE): **35M to 50M tokens**
+   (dump 50M once on the high-VRAM teacher node: 40M short at 4K + 10M long at
+   16K to 32K). Higher expert sparsity (288 vs 40 experts) reduces per-expert
+   token hits by 7.2x, so 35M to 50M tokens is required to converge both the
+   74M+ `intermediate_scales_fp16` codebook gains and the 3 shared host-RAM
+   depth banks (`524287` prime buckets per bigram/trigram/skip head).
 3. Keep router weights and sparse attention indexers permanently frozen during
-   QEC distillation.
+   QEC distillation, and keep text-backbone RMSNorm weights promoted to FP32.
 
 The script automatically merges Attention LoRA deltas back into the attention
 weights (`merged_non_expert_qec.pt`) and exports the Host-RAM Engram sidecar
