@@ -104,6 +104,41 @@ class _ShardStream:
         )
 
 
+class _MultiLengthShardStream:
+    """Round-robin reader across one or more homogeneous shard directories (e.g. 16K, 32K, 64K)."""
+
+    def __init__(self, shard_dirs: list[str | Path]) -> None:
+        self.streams = [_ShardStream(d) for d in shard_dirs]
+        if not self.streams:
+            raise ValueError("at least one shard directory is required")
+        # Interleave shard directories proportionally by shard count so every milestone sees all lengths
+        counts = [max(1, len(st.paths)) for st in self.streams]
+        total = sum(counts)
+        placed = [0] * len(self.streams)
+        self.schedule: list[int] = []
+        for step in range(total):
+            best_i = max(
+                range(len(self.streams)),
+                key=lambda i: ((step + 1) * counts[i]) / total - placed[i],
+            )
+            self.schedule.append(best_i)
+            placed[best_i] += 1
+        self._pos = 0
+        self.seq_len = int(
+            round(
+                sum(st.seq_len * max(1, len(st.paths)) for st in self.streams)
+                / max(1, len(self.schedule))
+            )
+        )
+
+    def take(
+        self, count: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        idx = self.schedule[self._pos % len(self.schedule)]
+        self._pos += 1
+        return self.streams[idx].take(count)
+
+
 def _input_device(model: torch.nn.Module) -> torch.device:
     if hasattr(model, "get_input_embeddings"):
         emb = model.get_input_embeddings()
@@ -277,7 +312,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus", default="", help="Short-context pre-tokenized int32 [N, seq_len] .pt file")
     parser.add_argument("--long-corpus", default="", help="Long-context pre-tokenized int32 [N, seq_len] .pt file")
     parser.add_argument("--teacher-shards", default="", help="Directory of pre-dumped short-context sparse top-K teacher shards")
-    parser.add_argument("--long-teacher-shards", default="", help="Directory of pre-dumped long-context sparse top-K teacher shards")
+    parser.add_argument(
+        "--long-teacher-shards",
+        nargs="*",
+        default=[],
+        help="One or more directories of pre-dumped long-context sparse top-K teacher shards (e.g. 16K, 32K, 64K)",
+    )
     parser.add_argument("--eval-dense-dir", default="", help="Optional eval_dense/ directory for untouched FP64 KLD milestones")
     parser.add_argument("--eval-milestones-m", default="10,35,50,75,100", help="Comma-separated token milestones (millions) for eval + checkpointing")
     parser.add_argument("--long-fraction", type=float, default=0.20)
@@ -340,7 +380,8 @@ def main() -> None:
     dp_rank = 0 if dp_world == 1 else rank
 
     short_shards = _ShardStream(args.teacher_shards) if use_shards else None
-    long_shards = _ShardStream(args.long_teacher_shards) if args.long_teacher_shards else None
+    long_shard_dirs = [d for d in (args.long_teacher_shards or []) if d]
+    long_shards = _MultiLengthShardStream(long_shard_dirs) if long_shard_dirs else None
     short_corpus = None if use_shards else torch.load(args.corpus, map_location="cpu", weights_only=True)
     long_corpus = (
         torch.load(args.long_corpus, map_location="cpu", weights_only=True)
@@ -605,9 +646,9 @@ def main() -> None:
         opt.step()
         sched.step()
         if is_long:
-            long_tokens_seen += long_tokens_per_step
+            long_tokens_seen += int(step_ids.shape[0] * (step_ids.shape[1] - 1))
         else:
-            short_tokens_seen += short_tokens_per_step
+            short_tokens_seen += int(step_ids.shape[0] * (step_ids.shape[1] - 1))
 
         seen = short_tokens_seen + long_tokens_seen
         seen_m = seen / 1e6
