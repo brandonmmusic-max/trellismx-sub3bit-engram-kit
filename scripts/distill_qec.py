@@ -213,9 +213,9 @@ def _load_model(
             kwargs["distributed_config"] = DistributedConfig(
                 ep_size=world_size,
                 tp_size=world_size,
-                tp_plan={},
                 fsdp_size=1,
                 pp_size=1,
+                ep_implementation="all_reduce",
             )
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
