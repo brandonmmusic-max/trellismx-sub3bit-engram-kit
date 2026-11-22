@@ -190,6 +190,7 @@ def _load_model(
     world_size: int,
     trust_remote_code: bool,
     attn_implementation: str = "",
+    experts_implementation: str = "",
 ) -> torch.nn.Module:
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     archs = list(getattr(cfg, "architectures", None) or ())
@@ -205,6 +206,8 @@ def _load_model(
     }
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+    if experts_implementation:
+        kwargs["experts_implementation"] = experts_implementation
 
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
@@ -504,6 +507,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map-auto", action="store_true", help="Shard frozen student across GPUs with device_map='auto'")
     parser.add_argument("--distributed-ep", action="store_true", help="Run torchrun Expert/Tensor Parallel student")
     parser.add_argument("--attn-implementation", default="")
+    parser.add_argument("--experts-implementation", default="", help="Optional HF experts_implementation (e.g. grouped_mm)")
     parser.add_argument("--topk", type=int, default=128)
     parser.add_argument("--loss-chunk-tokens", type=int, default=512)
     parser.add_argument("--save-every", type=int, default=0)
@@ -580,6 +584,7 @@ def main() -> None:
         world_size=world_size,
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
+        experts_implementation=args.experts_implementation,
     )
     if args.per_expert_release:
         _install_per_expert_release(

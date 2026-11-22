@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-world", type=int, default=1, help="Total independent worker count for shard partitioning")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--attn-implementation", default="")
+    parser.add_argument("--experts-implementation", default="", help="Optional HF experts_implementation (e.g. grouped_mm)")
     parser.add_argument("--resume", action="store_true", help="Skip already-written output shards")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -69,6 +70,7 @@ def load_hf_model(
     world_size: int,
     trust_remote_code: bool,
     attn_implementation: str = "",
+    experts_implementation: str = "",
 ) -> torch.nn.Module:
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     archs = list(getattr(cfg, "architectures", None) or ())
@@ -84,6 +86,8 @@ def load_hf_model(
     }
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+    if experts_implementation:
+        kwargs["experts_implementation"] = experts_implementation
 
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
@@ -298,6 +302,7 @@ def main() -> None:
         world_size=world_size,
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
+        experts_implementation=args.experts_implementation,
     )
 
     manifest: dict[str, object] = {
