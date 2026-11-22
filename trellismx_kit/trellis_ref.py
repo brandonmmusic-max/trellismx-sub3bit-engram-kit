@@ -65,6 +65,8 @@ def state_lut() -> torch.Tensor:
 def pack_symbols(symbols: torch.Tensor, rate: str) -> torch.Tensor:
     """Pack branch symbols into little-endian int16 trellis words."""
     _validate_rate(rate)
+    if symbols.dtype == torch.bool or symbols.is_floating_point():
+        raise TypeError("symbols must use an integer dtype")
     bits = STREAM_BITS[rate]
     expected = SYMBOLS_PER_TILE[rate]
     if symbols.shape[-1] != expected:
@@ -126,10 +128,11 @@ def decode_tile_operands(words: torch.Tensor, rate: str) -> torch.Tensor:
     symbols = unpack_symbols(words, rate)
     states = tile_states(symbols, rate)
     table = _state_bytes().to(words.device)
-    operands = table[states.to(torch.int64)]
+    state_u16 = states.to(torch.int64) & 0xFFFF
+    operands = table[state_u16]
     if rate == "p25":
         pair_first = operands
-        pair_second = table[_pair_states(states).to(torch.int64)]
+        pair_second = table[_pair_states(states).to(torch.int64) & 0xFFFF]
         operands = torch.stack((pair_first, pair_second), dim=-1).flatten(-2)
     return operands.contiguous()
 

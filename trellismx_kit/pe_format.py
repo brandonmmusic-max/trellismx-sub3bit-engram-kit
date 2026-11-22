@@ -1,8 +1,9 @@
 """Model-neutral four-bank (K2, P25, K3, K4) TrellisMX rank sidecar format.
 
 Supports any MoE geometry declared by ModelProfile, lossless CSF compression of
-UE8M0 scale planes with bit-exact write/read verification, canonical assignment
-hashing, and flattened device stream layout for per-expert P8 fused MoE kernels.
+UE8M0 scale planes with globally optimal per-row [b, b+1] base selection and
+bit-exact write/read verification, canonical assignment hashing, and flattened
+device stream layout for per-expert P8 fused MoE kernels.
 """
 
 from __future__ import annotations
@@ -34,13 +35,14 @@ from .trellis_ref import (
 
 SIDECAR_SCHEMA = "trellismx-p8-coupled-per-expert-rank.v2"
 ASSIGNMENT_SCHEMA = "trellismx.rate-assignment.v2"
-CSF_ENCODING = "ue8m0-row-base-offset1-u24-exceptions.v1"
+CSF_ENCODING = "ue8m0-row-base-offset1-u32-exceptions.v1"
+_ACCEPTED_CSF_ENCODINGS = frozenset({CSF_ENCODING, "ue8m0-row-base-offset1-u24-exceptions.v1"})
 SCALE_STORAGE = ("plain", "csf")
 
 
 @dataclass(frozen=True)
 class CsfPlane:
-    """Lossless row-base + 1-bit delta + u24 exception table for a UE8M0 plane."""
+    """Lossless row-base + 1-bit delta + uint32 exception table for a UE8M0 plane."""
 
     row_base: torch.Tensor      # uint8 [rows]
     bitplane: torch.Tensor      # uint8 [rows, ceil(cols / 8)]
@@ -75,8 +77,17 @@ class DeviceLayout:
 
 
 def tensor_sha256(value: torch.Tensor) -> str:
-    raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()
+
+
+def _optimal_pair_base(flat_u8: torch.Tensor) -> torch.Tensor:
+    """Choose b in [0, 254] per row maximizing count(b) + count(b + 1)."""
+    rows = flat_u8.shape[0]
+    hist = torch.zeros((rows, 256), dtype=torch.int32)
+    hist.scatter_add_(1, flat_u8.to(torch.int64), torch.ones_like(flat_u8, dtype=torch.int32))
+    pair_counts = hist[:, :-1] + hist[:, 1:]
+    return pair_counts.argmax(dim=1).to(torch.uint8)
 
 
 def encode_csf_plane(plane: torch.Tensor) -> CsfPlane:
@@ -85,8 +96,7 @@ def encode_csf_plane(plane: torch.Tensor) -> CsfPlane:
         raise TypeError("UE8M0 scale plane must be uint8")
     flat = plane.detach().cpu().contiguous().reshape(-1, plane.shape[-1])
     rows, cols = flat.shape
-    # Row mode / median base: median minimizes 1-bit offset exceptions on smooth UE8M0 rows
-    base = flat.median(dim=1).values.to(torch.uint8)
+    base = _optimal_pair_base(flat)
     delta = flat.to(torch.int16) - base[:, None].to(torch.int16)
     in_range = (delta == 0) | (delta == 1)
     bits = (delta == 1).to(torch.uint8)
@@ -111,7 +121,6 @@ def encode_csf_plane(plane: torch.Tensor) -> CsfPlane:
         rows=rows,
         cols=cols,
     )
-    # Fail-closed bit-exact round-trip check before returning
     decoded = decode_csf_plane(encoded, shape=plane.shape)
     if not torch.equal(decoded, plane.detach().cpu()):
         raise RuntimeError("CSF lossless round-trip verification failed")
@@ -275,7 +284,7 @@ def write_rank_sidecar(
 
 
 def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
-    """Read, validate hashes/geometry, and expand CSF scales for one rank sidecar."""
+    """Read, validate hashes/geometry/dtypes, and expand CSF scales for one rank sidecar."""
     profile.validate()
     p = Path(path)
     with safe_open(str(p), framework="pt", device="cpu") as fh:
@@ -284,6 +293,10 @@ def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
             raise ValueError(f"unexpected sidecar schema {metadata.get('schema')!r}")
         if metadata.get("law") != CODEC_LAW:
             raise ValueError(f"unexpected codec law {metadata.get('law')!r}; expected {CODEC_LAW!r}")
+        if float(metadata.get("compander_scale", "-1")) != COMPANDER_SCALE:
+            raise ValueError(
+                f"unexpected compander_scale {metadata.get('compander_scale')!r}; expected {COMPANDER_SCALE}"
+            )
         if (
             int(metadata.get("pair_mix_multiplier", -1)) != PAIR_MIX[0]
             or int(metadata.get("pair_mix_increment", -1)) != PAIR_MIX[1]
@@ -304,10 +317,15 @@ def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
 
     rates_u8 = tensors["expert_rate_u8"]
     slots_u16 = tensors["expert_slot_u16"]
+    if rates_u8.dtype != torch.uint8:
+        raise ValueError(f"expert_rate_u8 must be uint8, got {rates_u8.dtype}")
+    if slots_u16.dtype not in (torch.uint16, torch.int16):
+        raise ValueError(f"expert_slot_u16 must be uint16/int16, got {slots_u16.dtype}")
     if tuple(rates_u8.shape) != (profile.num_experts,) or tuple(slots_u16.shape) != (profile.num_experts,):
         raise ValueError("expert rate/slot table shape disagrees with profile.num_experts")
-    if bool((rates_u8 >= len(RATES)).any()):
-        raise ValueError("expert_rate_u8 contains an invalid rate code")
+    allowed_codes = {RATE_CODE[r] for r in profile.rates}
+    if any(int(c) not in allowed_codes for c in rates_u8.tolist()):
+        raise ValueError("expert_rate_u8 contains a rate code outside profile.rates")
 
     running = {code: 0 for code in RATE_CODE.values()}
     for e in range(profile.num_experts):
@@ -315,18 +333,34 @@ def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
         if int(slots_u16[e].item()) != running[code]:
             raise ValueError(f"expert {e} slot index disagrees with ascending bank order")
         running[code] += 1
+
+    h_tiles = profile.hidden_tiles
+    i_tiles = profile.local_intermediate_tiles
     for r, code in RATE_CODE.items():
-        if int(metadata[f"experts_{r}"]) != running[code]:
+        cnt = running[code]
+        if int(metadata[f"experts_{r}"]) != cnt:
             raise ValueError(f"metadata count for {r} disagrees with expert_rate_u8")
         present_13 = f"w13_trellis_{r}" in tensors
         present_2 = f"w2_trellis_{r}" in tensors
-        if (running[code] > 0) != present_13 or (running[code] > 0) != present_2:
-            raise ValueError(f"bank tensor presence for {r} disagrees with count {running[code]}")
+        if (cnt > 0) != present_13 or (cnt > 0) != present_2:
+            raise ValueError(f"bank tensor presence for {r} disagrees with count {cnt}")
+        if cnt > 0:
+            w13 = tensors[f"w13_trellis_{r}"]
+            w2 = tensors[f"w2_trellis_{r}"]
+            exp_w13 = (2, cnt, h_tiles, i_tiles, TILE_I16[r])
+            exp_w2 = (cnt, i_tiles, h_tiles, TILE_I16[r])
+            if w13.dtype != torch.int16 or tuple(w13.shape) != exp_w13:
+                raise ValueError(f"w13_trellis_{r} shape/dtype mismatch: {w13.dtype} {tuple(w13.shape)}")
+            if w2.dtype != torch.int16 or tuple(w2.shape) != exp_w2:
+                raise ValueError(f"w2_trellis_{r} shape/dtype mismatch: {w2.dtype} {tuple(w2.shape)}")
 
     scale_storage = metadata["scale_storage"]
     exp_s13 = (profile.num_experts, 2 * profile.local_intermediate_size, profile.hidden_size // 32)
     exp_s2 = (profile.num_experts, profile.hidden_size, profile.local_intermediate_size // 32)
     if scale_storage == "csf":
+        enc = metadata.get("csf_encoding")
+        if enc not in _ACCEPTED_CSF_ENCODINGS:
+            raise ValueError(f"unsupported csf_encoding {enc!r}")
         for prefix, shape in (("w13", exp_s13), ("w2", exp_s2)):
             rows = shape[0] * shape[1]
             cols = shape[2]
@@ -342,7 +376,12 @@ def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
             if tensor_sha256(expanded) != metadata[f"sha256_{prefix}_scale_ue8m0"]:
                 raise ValueError(f"expanded CSF hash mismatch for {prefix}_scale_ue8m0")
             tensors[f"{prefix}_scale_ue8m0"] = expanded
-    elif scale_storage != "plain":
+    elif scale_storage == "plain":
+        for name, shape in (("w13_scale_ue8m0", exp_s13), ("w2_scale_ue8m0", exp_s2)):
+            st = tensors[name]
+            if st.dtype != torch.uint8 or tuple(st.shape) != shape:
+                raise ValueError(f"{name} shape/dtype mismatch: {st.dtype} {tuple(st.shape)}")
+    else:
         raise ValueError(f"unsupported scale_storage {scale_storage!r}")
 
     return Sidecar(
@@ -351,7 +390,7 @@ def read_rank_sidecar(path: str | Path, profile: ModelProfile) -> Sidecar:
         rank=int(metadata["rank"]),
         metadata=metadata,
         rates=rates_u8,
-        slots=slots_u16,
+        slots=slots_u16.to(torch.uint16),
         tensors=tensors,
     )
 
@@ -373,8 +412,8 @@ def device_layout(sidecar: Sidecar, profile: ModelProfile) -> DeviceLayout:
         key2 = f"w2_trellis_{r}"
         if key13 not in sidecar.tensors:
             continue
-        w13 = sidecar.tensors[key13]  # [2, E_r, h_tiles, i_tiles, TILE_I16[r]]
-        w2 = sidecar.tensors[key2]    # [E_r, i_tiles, h_tiles, TILE_I16[r]]
+        w13 = sidecar.tensors[key13]
+        w2 = sidecar.tensors[key2]
         g_u32 = w13[0].contiguous().view(torch.int32).reshape(-1)
         u_u32 = w13[1].contiguous().view(torch.int32).reshape(-1)
         d_u32 = w2.contiguous().view(torch.int32).reshape(-1)
@@ -387,6 +426,9 @@ def device_layout(sidecar: Sidecar, profile: ModelProfile) -> DeviceLayout:
         g_cursor += int(g_u32.numel())
         u_cursor += int(u_u32.numel())
         d_cursor += int(d_u32.numel())
+
+    if max(g_cursor, u_cursor, d_cursor) >= (1 << 31):
+        raise ValueError("flattened stream exceeds signed int32 word addressing limit")
 
     gate_base = torch.empty(profile.num_experts, dtype=torch.int32)
     up_base = torch.empty(profile.num_experts, dtype=torch.int32)
@@ -460,7 +502,6 @@ def synthetic_rank_sidecar(
             -32768, 32768, (counts[r], profile.local_intermediate_tiles, profile.hidden_tiles, TILE_I16[r]),
             generator=gen, dtype=torch.int16,
         )
-    # Smooth realistic UE8M0 scales centered around 120..128 with occasional outliers
     s13 = torch.randint(120, 122, (profile.num_experts, 2 * profile.local_intermediate_size, profile.hidden_size // 32), generator=gen, dtype=torch.uint8)
     s2 = torch.randint(121, 123, (profile.num_experts, profile.hidden_size, profile.local_intermediate_size // 32), generator=gen, dtype=torch.uint8)
     s13.reshape(-1)[::97] = 135

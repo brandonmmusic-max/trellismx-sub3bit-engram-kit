@@ -31,14 +31,19 @@ def tokenwise_kld_fp64(
     """Return exact FP64 per-position KL(teacher || student) and uint8 top-1 match."""
     if teacher_logits.shape != student_logits.shape or teacher_logits.ndim != 2:
         raise ValueError("teacher_logits and student_logits must be matching 2D [N, V] tensors")
+    n = int(teacher_logits.shape[0])
+    if n == 0:
+        return torch.empty((0,), dtype=torch.float64), torch.empty((0,), dtype=torch.uint8)
     klds, agree = [], []
-    n = teacher_logits.shape[0]
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
         t = teacher_logits[start:stop].double().log_softmax(dim=-1)
         s = student_logits[start:stop].double().log_softmax(dim=-1)
-        klds.append((t.exp() * (t - s)).sum(dim=-1).cpu())
-        agree.append((t.argmax(dim=-1) == s.argmax(dim=-1)).to(torch.uint8).cpu())
+        t_p = t.exp()
+        # Guard masked -inf vocab entries so 0.0 * (-inf) never yields NaN
+        term = torch.where(t_p > 0.0, t_p * (t - s), torch.zeros_like(t))
+        klds.append(term.sum(dim=-1).clamp_min(0.0).detach().cpu())
+        agree.append((t.argmax(dim=-1) == s.argmax(dim=-1)).to(torch.uint8).detach().cpu())
     return torch.cat(klds), torch.cat(agree)
 
 
@@ -52,10 +57,16 @@ def summarize_windows(
     """Compute headline mean, window-block bootstrap 95% CI, tails, and top-1 agreement."""
     if not window_klds or len(window_klds) != len(window_agree):
         raise ValueError("window_klds and window_agree must have equal nonempty length")
-    all_kld = torch.cat([w.double().reshape(-1) for w in window_klds]).numpy()
-    all_agree = torch.cat([w.double().reshape(-1) for w in window_agree]).numpy()
-    win_means = np.array([float(w.double().mean().item()) for w in window_klds], dtype=np.float64)
-    win_weights = np.array([int(w.numel()) for w in window_klds], dtype=np.float64)
+    kld_cpu = [w.detach().cpu().double().reshape(-1) for w in window_klds]
+    agree_cpu = [a.detach().cpu().double().reshape(-1) for a in window_agree]
+    for i, (wk, wa) in enumerate(zip(kld_cpu, agree_cpu, strict=True)):
+        if wk.numel() == 0 or wk.numel() != wa.numel():
+            raise ValueError(f"window {i} has empty or mismatched length ({wk.numel()} vs {wa.numel()})")
+
+    all_kld = torch.cat(kld_cpu).numpy()
+    all_agree = torch.cat(agree_cpu).numpy()
+    win_means = np.array([float(w.mean().item()) for w in kld_cpu], dtype=np.float64)
+    win_weights = np.array([int(w.numel()) for w in kld_cpu], dtype=np.float64)
 
     rng = np.random.default_rng(seed)
     n_win = len(win_means)

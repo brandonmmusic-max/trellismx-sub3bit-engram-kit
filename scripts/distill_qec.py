@@ -2,36 +2,10 @@
 """Model-neutral DDP Full-Stack QEC distillation CLI with 80/20 context curriculum.
 
 Freezes all routed MoE expert weights, routers, and sparse attention indexers of
-a quantized Hugging Face checkpoint and distills mergeable Attention LoRA,
-RMSNorm scales, and Host-RAM Engram QEC tables against either a live teacher
-model or pre-dumped sparse top-K teacher shards (with exact full-vocabulary
-logsumexp tail calibration).
-
-Default long-context curriculum allocates 80% of tokens to short 2K-4K windows
-for high-throughput n-gram saturation and 20% to long 16K-32K+ windows so
-Attention LoRA and Engram context gates calibrate across sparse long-context
-retrieval.
-
-Usage (4-GPU DDP with live teacher):
-    NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 scripts/distill_qec.py \
-        --profile configs/granite-3.1-3b-a800m.json \
-        --teacher-model /path/to/teacher \
-        --student-model /path/to/quantized-student \
-        --corpus /path/to/short_2048.pt \
-        --long-corpus /path/to/long_16384.pt \
-        --long-fraction 0.20 --long-batch-size 1 --grad-checkpointing \
-        --engram-layers 0,1,2,4,8,16,24,31 \
-        --tokens-m 50 --output /path/to/qec-out
-
-Usage (4-GPU DDP with pre-dumped sparse top-K teacher shards):
-    NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 scripts/distill_qec.py \
-        --profile configs/glm-5.3-flash.json \
-        --student-model /path/to/quantized-student \
-        --teacher-shards /path/to/short_shards \
-        --long-teacher-shards /path/to/long_shards \
-        --long-fraction 0.20 --long-batch-size 1 --grad-checkpointing \
-        --engram-layers 3,6,9,12,15,18,21,24,27,30,33,36,39,42,44 \
-        --buckets 524287 --tokens-m 50 --output /path/to/qec-out
+a quantized Hugging Face checkpoint and distills mergeable non-expert LoRA
+(attention, optional dense prefix MLP, optional shared experts), FP32-promoted
+text-backbone RMSNorm scales, and Dual-Trellis Host-RAM Engram QEC tables
+against either a live teacher or pre-dumped sparse top-K teacher shards.
 """
 
 from __future__ import annotations
@@ -45,7 +19,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM
 
@@ -70,14 +43,18 @@ class _ShardStream:
         self.seq_len = int(self._cur["token_ids"].shape[1])
 
     def _load(self, index: int) -> dict[str, torch.Tensor]:
-        data = torch.load(self.paths[index % len(self.paths)], map_location="cpu", weights_only=True)
-        for key in ("token_ids", "top_idx", "top_logits", "logsumexp"):
-            if key not in data:
-                raise KeyError(f"teacher shard {self.paths[index]} missing required tensor {key!r}")
+        path = self.paths[index % len(self.paths)]
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        if "token_ids" not in data or "top_idx" not in data:
+            raise KeyError(f"teacher shard {path} missing token_ids or top_idx")
+        if "top_logp" not in data and "top_logits" not in data:
+            raise KeyError(f"teacher shard {path} must contain top_logp or top_logits")
         return data
 
-    def take(self, count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        ids_parts, idx_parts, val_parts, lse_parts = [], [], [], []
+    def take(
+        self, count: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        ids_parts, idx_parts, logp_parts, ptail_parts, lse_parts = [], [], [], [], []
         remaining = count
         while remaining > 0:
             n_rows = int(self._cur["token_ids"].shape[0])
@@ -91,15 +68,25 @@ class _ShardStream:
             sl = slice(self._row_idx, self._row_idx + take_n)
             ids_parts.append(self._cur["token_ids"][sl])
             idx_parts.append(self._cur["top_idx"][sl])
-            val_parts.append(self._cur["top_logits"][sl])
-            lse_parts.append(self._cur["logsumexp"][sl])
+            if "top_logp" in self._cur:
+                logp_parts.append(self._cur["top_logp"][sl])
+            else:
+                # Backward compatibility with raw top_logits + logsumexp shards
+                raw = self._cur["top_logits"][sl].float()
+                lse = self._cur["logsumexp"][sl].float()
+                logp_parts.append((raw - lse.unsqueeze(-1)).to(torch.float16))
+            if "p_tail" in self._cur:
+                ptail_parts.append(self._cur["p_tail"][sl])
+            if "logsumexp" in self._cur:
+                lse_parts.append(self._cur["logsumexp"][sl])
             self._row_idx += take_n
             remaining -= take_n
         return (
             torch.cat(ids_parts, dim=0),
             torch.cat(idx_parts, dim=0),
-            torch.cat(val_parts, dim=0),
-            torch.cat(lse_parts, dim=0),
+            torch.cat(logp_parts, dim=0),
+            torch.cat(ptail_parts, dim=0) if ptail_parts else None,
+            torch.cat(lse_parts, dim=0) if lse_parts else None,
         )
 
 
@@ -114,19 +101,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-corpus", default="", help="Long-context pre-tokenized int32 [N, seq_len] .pt file (16K-32K+)")
     parser.add_argument("--teacher-shards", default="", help="Directory of pre-dumped short-context sparse top-K teacher shards")
     parser.add_argument("--long-teacher-shards", default="", help="Directory of pre-dumped long-context sparse top-K teacher shards")
-    parser.add_argument("--long-fraction", type=float, default=0.20, help="Fraction of distillation tokens on long-context sequences (default 0.20 for 80/20 split)")
+    parser.add_argument("--long-fraction", type=float, default=0.20, help="Fraction of distillation tokens on long-context sequences")
     parser.add_argument("--curriculum-mode", choices=("interleaved", "tail"), default="interleaved")
     parser.add_argument("--engram-layers", default="", help="Comma-separated layer indices for Engram QEC")
+    parser.add_argument("--engram-table-device", choices=("auto", "cpu"), default="auto", help="Pin Engram tables in host RAM ('cpu') for large MoE models")
     parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--train-dense-lora", action="store_true", help="Also attach mergeable LoRA to dense prefix MLP layers")
+    parser.add_argument("--train-shared-lora", action="store_true", help="Also attach mergeable LoRA to BF16/FP8 shared experts")
     parser.add_argument("--buckets", type=int, default=262_139)
+    parser.add_argument("--skip-heads", type=int, default=2)
     parser.add_argument("--unigram-only", action="store_true")
     parser.add_argument("--tokens-m", type=float, default=50.0)
-    parser.add_argument("--batch-size", type=int, default=4, help="Micro-batch size for short-context steps")
-    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps for short-context steps")
-    parser.add_argument("--long-batch-size", type=int, default=1, help="Micro-batch size for long-context steps")
-    parser.add_argument("--long-grad-accum", type=int, default=2, help="Gradient accumulation steps for long-context steps")
-    parser.add_argument("--grad-checkpointing", action="store_true", help="Enable gradient checkpointing on student backbone for long sequences")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=2)
+    parser.add_argument("--long-batch-size", type=int, default=1)
+    parser.add_argument("--long-grad-accum", type=int, default=2)
+    parser.add_argument("--grad-checkpointing", action="store_true")
     parser.add_argument("--topk", type=int, default=64)
+    parser.add_argument("--loss-chunk-tokens", type=int, default=512)
+    parser.add_argument("--save-every", type=int, default=0, help="Save resumable checkpoint every N optimizer steps (0 disables)")
+    parser.add_argument("--resume", default="", help="Optional path to a saved checkpoint .pt to resume from")
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -173,20 +168,29 @@ def main() -> None:
     teacher = None
     if not use_shards:
         teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model, local_files_only=True, torch_dtype=torch.bfloat16
+            args.teacher_model,
+            local_files_only=True,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=args.trust_remote_code,
         ).to(device).eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
 
     student = AutoModelForCausalLM.from_pretrained(
-        args.student_model, local_files_only=True, torch_dtype=torch.bfloat16
+        args.student_model,
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=args.trust_remote_code,
     ).to(device)
     if args.grad_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
 
     engram_layers = [int(x) for x in args.engram_layers.split(",") if x.strip()]
+    table_dev = torch.device("cpu") if args.engram_table_device == "cpu" else None
     ek = (
-        {"d_uni": 256, "n_bi_heads": 0, "n_tri_heads": 0}
+        {"d_uni": 256, "n_bi_heads": 0, "n_tri_heads": 0, "table_device": table_dev}
         if args.unigram_only
         else {
             "d_uni": 128,
@@ -196,6 +200,10 @@ def main() -> None:
             "d_tri": 64,
             "n_tri_heads": 2,
             "tri_buckets": args.buckets,
+            "d_skip": 64 if args.skip_heads > 0 else 0,
+            "n_skip_heads": args.skip_heads,
+            "skip_buckets": args.buckets,
+            "table_device": table_dev,
         }
     )
     qec = FullStackQEC(
@@ -205,16 +213,21 @@ def main() -> None:
         lora_rank=args.lora_rank,
         engram_kwargs=ek,
         train_norms=True,
+        train_dense_lora=args.train_dense_lora,
+        train_shared_lora=args.train_shared_lora,
     ).to(device)
+    qec.train()
 
-    model_run: torch.nn.Module = DDP(qec, device_ids=[local_rank]) if distributed else qec
+    # Use DDP when all trainable parameters live on GPU; CPU host-RAM table mode uses manual sync or single-rank TP
+    use_ddp = distributed and table_dev is None
+    model_run: torch.nn.Module = DDP(qec, device_ids=[local_rank]) if use_ddp else qec
     param_groups = qec.parameter_groups()
     opt = torch.optim.AdamW(param_groups)
 
     short_chunks_per_step = world_size * args.batch_size * args.grad_accum
     long_chunks_per_step = world_size * args.long_batch_size * args.long_grad_accum
-    short_tokens_per_step = short_chunks_per_step * short_seq_len
-    long_tokens_per_step = long_chunks_per_step * long_seq_len
+    short_tokens_per_step = short_chunks_per_step * (short_seq_len - 1)
+    long_tokens_per_step = long_chunks_per_step * (long_seq_len - 1)
 
     schedule = build_context_curriculum(
         total_tokens=max(1, int(round(args.tokens_m * 1e6))),
@@ -233,13 +246,28 @@ def main() -> None:
         return 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * prog))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    t0 = time.time()
+
+    start_step = 0
     short_cursor = 0
     long_cursor = 0
     short_tokens_seen = 0
     long_tokens_seen = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        qec.engrams.load_state_dict(ckpt["engrams"])
+        qec.loras.load_state_dict(ckpt["loras"])
+        opt.load_state_dict(ckpt["optimizer"])
+        sched.load_state_dict(ckpt["scheduler"])
+        start_step = int(ckpt["step"])
+        short_cursor = int(ckpt["short_cursor"])
+        long_cursor = int(ckpt["long_cursor"])
+        short_tokens_seen = int(ckpt["short_tokens_seen"])
+        long_tokens_seen = int(ckpt["long_tokens_seen"])
 
-    for step, phase in enumerate(schedule):
+    t0 = time.time()
+    out_dir = Path(args.output)
+    for step in range(start_step, total_steps):
+        phase = schedule[step]
         is_long = phase == "long"
         micro_bs = args.long_batch_size if is_long else args.batch_size
         grad_accum = args.long_grad_accum if is_long else args.grad_accum
@@ -248,14 +276,14 @@ def main() -> None:
         if use_shards:
             stream = long_shards if is_long else short_shards
             assert stream is not None
-            step_ids, step_idx, step_vals, step_lse = stream.take(chunks_this_step)
+            step_ids, step_idx, step_logp, step_ptail, _step_lse = stream.take(chunks_this_step)
         else:
             src_corpus = long_corpus if is_long else short_corpus
             assert src_corpus is not None
             cursor = long_cursor if is_long else short_cursor
             rows = [src_corpus[(cursor + i) % len(src_corpus)] for i in range(chunks_this_step)]
             step_ids = torch.stack(rows, dim=0)
-            step_idx = step_vals = step_lse = None
+            step_idx = step_logp = step_ptail = None
             if is_long:
                 long_cursor += chunks_this_step
             else:
@@ -267,30 +295,33 @@ def main() -> None:
             offset = (micro * world_size + rank) * micro_bs
             ids = step_ids[offset : offset + micro_bs].to(device=device, dtype=torch.long)
             if use_shards:
-                assert step_idx is not None and step_vals is not None and step_lse is not None
+                assert step_idx is not None and step_logp is not None
                 top_idx = step_idx[offset : offset + micro_bs].to(device=device, dtype=torch.long)
-                top_vals = step_vals[offset : offset + micro_bs].to(device=device, dtype=torch.float32)
-                t_lse = step_lse[offset : offset + micro_bs].to(device=device, dtype=torch.float32)
-                top_logp = top_vals - t_lse.unsqueeze(-1)
+                top_logp = step_logp[offset : offset + micro_bs].to(device=device, dtype=torch.float32)
+                p_tail = (
+                    step_ptail[offset : offset + micro_bs].to(device=device, dtype=torch.float32)
+                    if step_ptail is not None
+                    else None
+                )
             else:
                 assert teacher is not None
                 with torch.no_grad():
                     t_logits = teacher(input_ids=ids, use_cache=False).logits[:, :-1].float()
                     t_lse = torch.logsumexp(t_logits, dim=-1)
                     top_vals, top_idx = torch.topk(t_logits, k=args.topk, dim=-1)
-                    top_logp = top_vals - t_lse.unsqueeze(-1)
+                    top_logp = (top_vals - t_lse.unsqueeze(-1)).clamp_max(0.0)
+                    p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
 
-            qec.cur_tokens = ids
-            ctx = model_run.no_sync() if (distributed and micro + 1 < grad_accum) else torch.enable_grad()
+            ctx = model_run.no_sync() if (use_ddp and micro + 1 < grad_accum) else torch.enable_grad()
             with ctx:
-                s_logits = qec.model(input_ids=ids, use_cache=False).logits[:, :-1]
+                s_logits = model_run(input_ids=ids, use_cache=False).logits[:, :-1]
                 loss = (
                     topk_kl_loss(
                         s_logits,
                         top_logp,
                         top_idx,
-                        teacher_logsumexp=t_lse,
-                        teacher_top_logits=top_vals,
+                        teacher_p_tail=p_tail,
+                        chunk_tokens=args.loss_chunk_tokens,
                     )
                     / grad_accum
                 )
@@ -308,34 +339,45 @@ def main() -> None:
         if rank == 0 and ((step + 1) % 25 == 0 or step + 1 == total_steps):
             seen = short_tokens_seen + long_tokens_seen
             print(
-                f"step={step+1}/{total_steps} phase={phase} tokens={seen/1e6:.2f}M "
+                f"step={step+1}/{total_steps} phase={phase} positions={seen/1e6:.2f}M "
                 f"(short={short_tokens_seen/1e6:.2f}M long={long_tokens_seen/1e6:.2f}M) "
                 f"loss={acc_loss:.4f} t={time.time()-t0:.1f}s",
                 flush=True,
             )
 
+        if rank == 0 and args.save_every > 0 and (step + 1) % args.save_every == 0:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "step": step + 1,
+                    "engrams": qec.engrams.state_dict(),
+                    "loras": qec.loras.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "scheduler": sched.state_dict(),
+                    "short_cursor": short_cursor,
+                    "long_cursor": long_cursor,
+                    "short_tokens_seen": short_tokens_seen,
+                    "long_tokens_seen": long_tokens_seen,
+                },
+                out_dir / "checkpoint_latest.pt",
+            )
+
+    if distributed:
+        dist.barrier()
+
     if rank == 0:
-        out_dir = Path(args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         merged = qec.merge_lora_into_model()
         torch.save(qec.engrams.state_dict(), out_dir / "engram_qec_sidecar.pt")
-        norm_state = {
-            k: v.detach().cpu()
-            for k, v in qec.model.state_dict().items()
-            if (
-                ("norm" in k.lower() and "indexer" not in k.lower() and "router" not in k.lower())
-                or any(p in k for p in profile.attn_projections)
-            )
-        }
-        torch.save(norm_state, out_dir / "merged_non_expert_qec.pt")
+        torch.save(qec.export_non_expert_state(), out_dir / "merged_non_expert_qec.pt")
         total_seen = short_tokens_seen + long_tokens_seen
         (out_dir / "qec_manifest.json").write_text(
             json.dumps(
                 {
                     "profile": profile.name,
-                    "tokens": total_seen,
-                    "short_tokens": short_tokens_seen,
-                    "long_tokens": long_tokens_seen,
+                    "supervised_positions": total_seen,
+                    "short_positions": short_tokens_seen,
+                    "long_positions": long_tokens_seen,
                     "short_seq_len": short_seq_len,
                     "long_seq_len": long_seq_len if has_long else 0,
                     "long_fraction_target": effective_long_fraction,
@@ -344,6 +386,7 @@ def main() -> None:
                     "engram_layers": list(engram_layers),
                     "unigram_only": args.unigram_only,
                     "buckets": args.buckets,
+                    "skip_heads": args.skip_heads,
                 },
                 indent=2,
             )
@@ -353,6 +396,7 @@ def main() -> None:
         print(f"Saved QEC artifacts to {out_dir}", flush=True)
 
     if distributed:
+        dist.barrier()
         dist.destroy_process_group()
 
 

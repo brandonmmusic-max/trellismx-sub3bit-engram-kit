@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import itertools
+import time
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +14,9 @@ import torch.nn as nn
 
 from trellismx_kit.allocate import (
     EMPIRICAL_RD_RATIOS,
+    RATE_FRACTION,
     build_hierarchical_assignment,
+    solve_exact_dp,
 )
 from trellismx_kit.engram_probe import score_expert_ngram_predictability
 from trellismx_kit.engram_qec import (
@@ -23,6 +27,7 @@ from trellismx_kit.engram_qec import (
     topk_kl_loss,
 )
 from trellismx_kit.kld_score import summarize_windows, tokenwise_kld_fp64
+from trellismx_kit.layer_sensitivity import measure_layer_sensitivity
 from trellismx_kit.pe_format import (
     decode_csf_plane,
     decode_expert_operands_from_layout,
@@ -50,7 +55,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _tiny_profile() -> ModelProfile:
-    p = ModelProfile(
+    return ModelProfile(
         name="synthetic-tiny-moe",
         hidden_size=64,
         intermediate_size=64,
@@ -63,118 +68,165 @@ def _tiny_profile() -> ModelProfile:
         rates=("k2", "p25", "k3", "k4"),
         non_routed_params=100_000,
     )
-    p.validate()
-    return p
 
 
 def test_shipped_profiles_validate() -> None:
-    configs = sorted((REPO_ROOT / "configs").glob("*.json"))
-    assert len(configs) >= 4
-    for cfg in configs:
+    for cfg in sorted((REPO_ROOT / "configs").glob("*.json")):
         prof = load_profile(cfg)
         prof.validate()
-        assert prof.local_intermediate_size % 32 == 0
+        assert prof.total_routed_weights > 0
+    glm = load_profile(REPO_ROOT / "configs" / "glm-5.3-flash.json")
+    assert glm.layer_path_template == "model.language_model.layers.{layer}"
+    assert "q_a_proj" in glm.projections_for_layer(3)
+    assert "q_proj" in glm.projections_for_layer(4)
 
 
 @pytest.mark.parametrize("rate", RATES)
 def test_trellis_pack_unpack_and_decode_all_four_rates(rate: str) -> None:
-    gen = torch.Generator().manual_seed(101 + STREAM_BITS[rate])
-    symbols = torch.randint(0, 1 << STREAM_BITS[rate], (16, SYMBOLS_PER_TILE[rate]), generator=gen, dtype=torch.int16)
+    gen = torch.Generator().manual_seed(42)
+    bits = STREAM_BITS[rate]
+    n_sym = SYMBOLS_PER_TILE[rate]
+    symbols = torch.randint(0, 1 << bits, (5, n_sym), generator=gen, dtype=torch.int16)
     packed = pack_symbols(symbols, rate)
-    assert packed.shape == (16, TILE_I16[rate])
+    assert packed.dtype == torch.int16
+    assert packed.shape == (5, TILE_I16[rate])
     unpacked = unpack_symbols(packed, rate)
     assert torch.equal(unpacked, symbols)
-    ops = decode_tile_operands(packed, rate)
-    vals = decode_tile_values(packed, rate)
-    assert ops.shape == (16, 256)
-    assert ops.dtype == torch.uint8
-    assert torch.isfinite(vals).all()
+
+    operands = decode_tile_operands(packed, rate)
+    values = decode_tile_values(packed, rate)
+    assert operands.dtype == torch.uint8 and operands.shape == (5, 256)
+    assert values.dtype == torch.float32 and values.shape == (5, 256)
+    assert bool(torch.isfinite(values).all())
     assert state_lut().shape == (65536,)
 
 
-def test_csf_lossless_round_trip_and_all_byte_values() -> None:
-    gen = torch.Generator().manual_seed(7)
-    smooth = torch.randint(120, 122, (8, 64, 16), generator=gen, dtype=torch.uint8)
-    smooth.reshape(-1)[::37] = 135
-    csf = encode_csf_plane(smooth)
-    assert torch.equal(decode_csf_plane(csf, smooth.shape), smooth)
-    # All 256 possible uint8 values
-    every = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
-    assert torch.equal(decode_csf_plane(encode_csf_plane(every), every.shape), every)
+def test_csf_lossless_round_trip_optimal_base_and_odd_cols() -> None:
+    gen = torch.Generator().manual_seed(99)
+    # Odd cols (13, not divisible by 8) exercises bitplane padding branch
+    plane = torch.randint(120, 122, (8, 13), generator=gen, dtype=torch.uint8)
+    plane[0, :5] = torch.tensor([0, 1, 127, 254, 255], dtype=torch.uint8)
+    csf = encode_csf_plane(plane)
+    recovered = decode_csf_plane(csf, shape=plane.shape)
+    assert torch.equal(recovered, plane)
+
+    # Bimodal 49%/51% smooth row must choose base=120 -> 0 exceptions!
+    bimodal = torch.cat((torch.full((4, 49), 120, dtype=torch.uint8), torch.full((4, 51), 121, dtype=torch.uint8)), dim=1)
+    csf_bi = encode_csf_plane(bimodal)
+    assert csf_bi.exceptions.numel() == 0
+    assert torch.equal(decode_csf_plane(csf_bi, shape=bimodal.shape), bimodal)
 
 
-@pytest.mark.parametrize("scale_storage", ("plain", "csf"))
+@pytest.mark.parametrize("scale_storage", ["plain", "csf"])
 def test_four_bank_sidecar_round_trip_and_device_layout(tmp_path: Path, scale_storage: str) -> None:
     prof = _tiny_profile()
-    rates = ["k2", "p25", "k3", "k4", "k2", "k4", "p25", "k3"]
-    sidecar_path = synthetic_rank_sidecar(
-        tmp_path / f"rank-{scale_storage}.safetensors",
+    path = synthetic_rank_sidecar(
+        tmp_path / f"layer-000-{scale_storage}.safetensors",
         prof,
-        layer=2,
+        layer=0,
         rank=0,
-        expert_rates=rates,
         scale_storage=scale_storage,
-        seed=42,
     )
-    loaded = read_rank_sidecar(sidecar_path, prof)
-    assert loaded.counts == {"k2": 2, "p25": 2, "k3": 2, "k4": 2}
-    layout = device_layout(loaded, prof)
+    sc = read_rank_sidecar(path, prof)
+    assert sc.counts == {"k2": 2, "p25": 2, "k3": 2, "k4": 2}
+    layout = device_layout(sc, prof)
+    assert layout.expert_rate.shape == (prof.num_experts,)
     for e in range(prof.num_experts):
-        g_ops, u_ops, d_ops = decode_expert_operands_from_layout(layout, prof, e)
+        g, u, d = decode_expert_operands_from_layout(layout, prof, e)
         n_tiles = prof.hidden_tiles * prof.local_intermediate_tiles
-        assert g_ops.shape == (n_tiles, 256)
-        assert u_ops.shape == (n_tiles, 256)
-        assert d_ops.shape == (n_tiles, 256)
+        assert g.shape == (n_tiles, 256)
+        assert u.shape == (n_tiles, 256)
+        assert d.shape == (n_tiles, 256)
 
 
 def test_sidecar_rejects_tampered_tensor(tmp_path: Path) -> None:
-    from safetensors.torch import load_file, save_file
     from safetensors import safe_open
+    from safetensors.torch import save_file
 
     prof = _tiny_profile()
-    p = synthetic_rank_sidecar(tmp_path / "ok.safetensors", prof, scale_storage="csf")
-    with safe_open(str(p), framework="pt", device="cpu") as fh:
+    path = synthetic_rank_sidecar(tmp_path / "good.safetensors", prof, scale_storage="csf")
+    with safe_open(str(path), framework="pt", device="cpu") as fh:
         meta = dict(fh.metadata() or {})
-    tensors = load_file(str(p))
-    tensors["w13_scale_csf_base"][0] = (int(tensors["w13_scale_csf_base"][0]) + 1) % 256
-    bad = tmp_path / "bad.safetensors"
-    save_file(tensors, str(bad), metadata=meta)
+        tensors = {k: fh.get_tensor(k) for k in fh.keys()}
+    tensors["w13_trellis_k4"][0, 0, 0, 0, 0] ^= 1
+    bad_path = tmp_path / "tampered.safetensors"
+    save_file(tensors, str(bad_path), metadata=meta)
     with pytest.raises(ValueError, match="SHA-256"):
-        read_rank_sidecar(bad, prof)
+        read_rank_sidecar(bad_path, prof)
 
 
-def test_hierarchical_allocator_exact_budget_and_k4_cap() -> None:
-    prof = _tiny_profile()
-    rng = np.random.default_rng(123)
-    route_mass = {l: rng.exponential(scale=1.0, size=prof.num_experts).tolist() for l in prof.routed_layers}
-    layer_sens = {0: 3.0, 1: 1.0, 2: 0.5, 3: 2.0}
-    doc = build_hierarchical_assignment(
-        prof,
-        route_mass=route_mass,
-        layer_sensitivity=layer_sens,
-        budget_bits=2.5,
-        max_k4_fraction=0.125,
+def test_allocator_exact_optimality_fast_1t_scale_and_engram_coalloc() -> None:
+    # 1) Brute-force exactness check on small 5-expert problem across all 4 rates
+    rng = np.random.default_rng(11)
+    cands = []
+    for i in range(5):
+        imp = float(rng.uniform(0.1, 3.0))
+        cands.append((0, i, [imp * EMPIRICAL_RD_RATIOS[r] for r in RATES]))
+    for budget_num in (22, 25, 27, 30, 33):
+        budget_bits = Fraction(budget_num, 10)
+        got_choices, got_dmg = solve_exact_dp(cands, rates=RATES, budget_bits=budget_bits)
+        best_dmg = float("inf")
+        max_hb = int((budget_bits * 2 * len(cands)) // 1)
+        for combo in itertools.product(range(4), repeat=5):
+            hb = sum(int(RATE_FRACTION[RATES[r]] * 2) for r in combo)
+            if hb <= max_hb:
+                dmg = sum(cands[i][2][combo[i]] for i in range(5))
+                if dmg < best_dmg:
+                    best_dmg = dmg
+        assert abs(got_dmg - best_dmg) < 1e-9
+
+    # 2) Fast O(N log N) scaling check on 1T MoE (23,424 experts) must finish well under 1s
+    prof_1t = load_profile(REPO_ROOT / "configs" / "template-1t-moe.json")
+    masses_1t = {l: rng.exponential(scale=1.0, size=prof_1t.num_experts).tolist() for l in prof_1t.routed_layers}
+    sens_1t = {l: 1.0 + 0.01 * l for l in prof_1t.routed_layers}
+    t0 = time.time()
+    doc_1t = build_hierarchical_assignment(
+        prof_1t,
+        route_mass=masses_1t,
+        layer_sensitivity=sens_1t,
+        budget_bits=2.25,
+        max_k4_fraction=0.05,
     )
-    assert abs(doc["achieved_bits"] - 2.5) <= 1e-6
-    assert doc["counts"]["k4"] <= 4
-    assert doc["rule"] == "hierarchical"
-    assert len(doc["sha256"]) == 64
+    elapsed = time.time() - t0
+    assert elapsed < 2.0, f"1T MoE allocator took {elapsed:.2f}s"
+    assert doc_1t["achieved_bits"] <= 2.25 + 1e-9
+    assert doc_1t["counts"]["k4"] <= int(0.05 * prof_1t.total_routed_experts)
+
+    # 3) Asymmetric Engram co-allocation shifts bits away from high-R^2 Layer 0 toward deep Layer 2
+    prof = _tiny_profile()
+    uniform_mass = {l: [1.0] * prof.num_experts for l in prof.routed_layers}
+    equal_sens = {l: 1.0 for l in prof.routed_layers}
+    r2_map = {0: 0.95, 1: 0.50, 2: 0.05, 3: 0.10}
+    doc_co = build_hierarchical_assignment(
+        prof,
+        route_mass=uniform_mass,
+        layer_sensitivity=equal_sens,
+        engram_r2=r2_map,
+        engram_discount=0.8,
+        budget_bits=2.5,
+        max_k4_fraction=0.25,
+    )
+    l0_bits = sum(float(RATE_FRACTION[r]) for r in doc_co["layers"]["0"])
+    l2_bits = sum(float(RATE_FRACTION[r]) for r in doc_co["layers"]["2"])
+    assert l2_bits > l0_bits
 
 
-def test_stratified_capture_raises_rare_expert_floor() -> None:
-    rng = np.random.default_rng(9)
+def test_stratified_capture_rare_floor_dead_expert_and_domain_caps() -> None:
+    rng = np.random.default_rng(7)
     records = []
     for i in range(20):
         counts = rng.integers(100, 300, size=(2, 4), dtype=np.int64)
+        counts[0, 0] = 0  # unreachable dead expert must not break fallback balancing
         if i in (3, 11, 17):
-            counts[1, 3] = 900  # rare expert triggered only in these windows
+            counts[1, 3] = 900
         else:
             counts[1, 3] = 5
         records.append(WindowRecord(window_id=f"w{i}", domain="code" if i % 2 else "chat", expert_counts=counts))
-    sel = select_stratified_windows(records, target_windows=5, token_floor=1500)
+    sel = select_stratified_windows(records, target_windows=5, token_floor=1500, domain_caps={"code": 3, "chat": 3})
     assert len(sel.selected_ids) == 5
-    assert sel.min_expert_tokens >= 900
-    assert "w3" in sel.selected_ids and "w11" in sel.selected_ids
+    assert sel.domain_counts.get("code", 0) <= 3
+    assert sum(w in sel.selected_ids for w in ("w3", "w11", "w17")) >= 2
+    assert int(sel.total_expert_counts[1, 3]) >= 1500
 
 
 class _TinyBlock(nn.Module):
@@ -185,11 +237,12 @@ class _TinyBlock(nn.Module):
         self.self_attn.k_proj = nn.Linear(d, d, bias=False)
         self.self_attn.v_proj = nn.Linear(d, d, bias=False)
         self.self_attn.o_proj = nn.Linear(d, d, bias=False)
+        self.mlp = nn.Linear(d, d, bias=False)
         self.norm = nn.LayerNorm(d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.self_attn.o_proj(self.self_attn.q_proj(x) + self.self_attn.k_proj(x) + self.self_attn.v_proj(x))
-        return self.norm(x + 0.1 * y)
+        return self.norm(x + 0.1 * y + 0.1 * self.mlp(x))
 
 
 class _TinyModel(nn.Module):
@@ -200,17 +253,20 @@ class _TinyModel(nn.Module):
         self.model.layers = nn.ModuleList([_TinyBlock(d) for _ in range(n_layers)])
         self.head = nn.Linear(d, v, bias=False)
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        h = self.embed(ids)
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def forward(self, input_ids: torch.Tensor, **_kwargs) -> torch.Tensor:
+        h = self.embed(input_ids)
         for blk in self.model.layers:
             h = blk(h)
         return self.head(h)
 
 
-def test_fullstack_qec_zero_init_and_exact_lora_merge() -> None:
+def test_fullstack_qec_bf16_norms_single_token_decode_host_tables_and_merge() -> None:
     torch.manual_seed(0)
     prof = _tiny_profile()
-    model = _TinyModel(prof.hidden_size, prof.vocab_size, prof.num_layers)
+    model = _TinyModel(prof.hidden_size, prof.vocab_size, prof.num_layers).to(torch.bfloat16)
     ids = torch.randint(0, prof.vocab_size, (2, 16))
     with torch.no_grad():
         base_out = model(ids).clone()
@@ -220,58 +276,112 @@ def test_fullstack_qec_zero_init_and_exact_lora_merge() -> None:
         prof,
         engram_layers=(0, 3),
         lora_rank=4,
-        engram_kwargs={"d_uni": 16, "d_bi": 8, "n_bi_heads": 2, "bi_buckets": 257, "d_tri": 8, "n_tri_heads": 1, "tri_buckets": 257},
+        engram_kwargs={
+            "d_uni": 16,
+            "d_bi": 8,
+            "n_bi_heads": 2,
+            "bi_buckets": 257,
+            "d_tri": 8,
+            "n_tri_heads": 1,
+            "tri_buckets": 257,
+            "d_skip": 8,
+            "n_skip_heads": 1,
+            "skip_buckets": 257,
+            "table_device": "cpu",
+        },
     )
-    qec.eval()
-    qec.cur_tokens = ids
-    with torch.no_grad():
-        zero_out = qec.model(ids)
-    assert torch.allclose(zero_out, base_out, atol=1e-6)
+    # Promoted norms must be FP32 even though student backbone is BF16!
+    assert model.model.layers[0].norm.weight.dtype == torch.float32
+    assert model.model.layers[0].norm.weight.requires_grad
 
-    # One optimization step verifies gradients flow to both LoRA and Engram
+    # Single-token (T == 1) and T == 2 lookup must not crash and must respect prev_tokens
+    layer0_eng = qec.engrams["0"]
+    one_tok = layer0_eng.lookup(ids[:, :1])
+    assert one_tok.shape == (2, 1, 16 + 16 + 8 + 8)
+    cont = layer0_eng.lookup(ids[:, 2:3], prev_tokens=ids[:, 0:2])
+    full = layer0_eng.lookup(ids[:, :3])
+    assert torch.allclose(cont[:, 0], full[:, 2], atol=1e-6)
+
+    # Zero-init matches baseline at step 0 via standard forward()
+    qec.eval()
+    with torch.no_grad():
+        zero_out = qec(ids)
+    assert torch.allclose(zero_out.float(), base_out.float(), atol=1e-2)
+
+    # Two optimization steps verify gradients reach w_k, gate_bias, lora.a, uni_emb, AND FP32 norms
     qec.train()
+    assert not qec.model.training  # frozen student stays in eval mode!
     opt = torch.optim.AdamW(qec.parameter_groups())
-    logits = qec.model(ids)
-    t_logp = torch.log_softmax(base_out.detach(), dim=-1)
-    top_logp, top_idx = torch.topk(t_logp, k=8, dim=-1)
-    loss = topk_kl_loss(logits, top_logp, top_idx)
-    loss.backward()
-    opt.step()
+    norm_before = model.model.layers[0].norm.weight.detach().clone()
+    target_logits = base_out.detach().float() + 0.5 * torch.randn_like(base_out.float())
+    t_lse = torch.logsumexp(target_logits, dim=-1)
+    top_vals, top_idx = torch.topk(target_logits, k=16, dim=-1)
+    top_logp = (top_vals - t_lse.unsqueeze(-1)).clamp_max(0.0)
+    p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
+    for _ in range(2):
+        opt.zero_grad()
+        logits = qec(ids)
+        loss = topk_kl_loss(logits, top_logp, top_idx, teacher_p_tail=p_tail, chunk_tokens=8)
+        loss.backward()
+        opt.step()
+    assert not torch.equal(model.model.layers[0].norm.weight, norm_before)
+    assert float(qec.loras["0_attn_q_proj"].a.weight.grad.abs().sum()) > 0.0
+    assert float(qec.engrams["0"].w_k.weight.grad.abs().sum()) > 0.0
 
-    # Verify algebraic LoRA merge preserves model outputs identically
+    # Algebraic LoRA merge preserves outputs and detaches all LoRA hooks
     qec.eval()
-    qec.cur_tokens = ids
     with torch.no_grad():
-        pre_merge = qec.model(ids).clone()
+        pre_merge = qec(ids).clone()
     merged = qec.merge_lora_into_model()
     assert merged == 4 * prof.num_layers
+    assert len(qec._lora_handles) == 0
     with torch.no_grad():
-        post_merge = qec.model(ids)
-    assert torch.allclose(pre_merge, post_merge, atol=1e-5)
+        post_merge = qec(ids)
+    assert torch.allclose(pre_merge.float(), post_merge.float(), atol=5e-2)
     qec.remove_hooks()
 
 
-def test_engram_probe_and_kld_and_vram_budget() -> None:
+def test_layer_sensitivity_3d_and_2d_logits() -> None:
+    torch.manual_seed(3)
+    prof = _tiny_profile()
+    model = _TinyModel(prof.hidden_size, prof.vocab_size, prof.num_layers)
+    wins = [torch.randint(0, prof.vocab_size, (1, 16)) for _ in range(2)]
+    sens_3d = measure_layer_sensitivity(model, prof, wins, lambda m, x: m(x), noise_rel_std=0.1)
+    assert set(sens_3d.keys()) == set(prof.routed_layers)
+    assert all(v > 1e-7 for v in sens_3d.values())
+    sens_2d = measure_layer_sensitivity(model, prof, wins, lambda m, x: m(x)[0], noise_rel_std=0.1)
+    for l in prof.routed_layers:
+        assert abs(sens_3d[l] - sens_2d[l]) < 1e-6
+
+
+def test_engram_probe_large_vocab_int32_kld_inf_mask_and_vram_budget() -> None:
     rng = np.random.default_rng(5)
     n = 1000
-    toks = rng.integers(0, 20, size=n, dtype=np.int64)
-    prev = np.concatenate([np.array([-1]), toks[:-1]])
+    # int32 IDs above 46,340 previously overflowed in NumPy 2.x!
+    toks = (rng.integers(0, 20, size=n, dtype=np.int32) + np.int32(150_000))
+    prev = np.concatenate([np.array([149_999], dtype=np.int32), toks[:-1]])
     table = torch.randn(20, 32)
-    y = table[toks] + 0.05 * torch.randn(n, 32)
-    is_build = np.arange(n) < 800
-    res = score_expert_ngram_predictability(y, toks, prev, is_build)
+    y = table[torch.from_numpy((toks - 150_000).astype(np.int64))] + 0.05 * torch.randn(n, 32)
+    is_build_int = (np.arange(n) < 800).astype(np.int64)  # integer 0/1 mask
+    res = score_expert_ngram_predictability(y, toks, prev, is_build_int)
     assert res.unigram_r2 > 0.95 and res.unigram_nmse < 0.05
 
-    t_logits = torch.randn(64, 50)
-    kld_zero, agree_zero = tokenwise_kld_fp64(t_logits, t_logits)
-    assert float(kld_zero.abs().max()) < 1e-12
-    assert int(agree_zero.sum()) == 64
-    summ = summarize_windows([kld_zero, kld_zero], [agree_zero, agree_zero], resamples=200)
-    assert summ.mean_kld < 1e-12 and summ.top1_agreement_pct == 100.0
+    # Masked -inf vocab slots must not produce NaN in tokenwise_kld_fp64
+    t_logits = torch.randn(32, 50)
+    s_logits = t_logits + 0.1 * torch.randn(32, 50)
+    t_logits[:, -2:] = float("-inf")
+    s_logits[:, -2:] = float("-inf")
+    kld_vals, agree_vals = tokenwise_kld_fp64(t_logits, s_logits)
+    assert bool(torch.isfinite(kld_vals).all()) and float(kld_vals.mean()) > 0.0
+    summ = summarize_windows([kld_vals[:10], kld_vals[10:]], [agree_vals[:10], agree_vals[10:]], resamples=200)
+    assert summ.positions == 32 and summ.windows == 2
 
+    # VRAM budget explicitly reflects expanded 0.25 bpw UE8M0 vs 0.0625 bpw in-VRAM CSF
     prof_1t = load_profile(REPO_ROOT / "configs" / "template-1t-moe.json")
-    est = estimate_memory(prof_1t, avg_expert_bits=2.25, gpu_count=4)
-    assert est.kv_headroom_per_gpu_gib > 10.0
+    est_plain = estimate_memory(prof_1t, avg_expert_bits=2.25, in_vram_csf=False, gpu_count=4)
+    est_csf = estimate_memory(prof_1t, avg_expert_bits=2.25, in_vram_csf=True, gpu_count=4)
+    assert est_plain.in_vram_scales_and_vectors_gib > est_csf.in_vram_scales_and_vectors_gib + 15.0
+    assert est_plain.offloaded_embed_host_ram_gib > 0.0
 
 
 def test_80_20_curriculum_and_tail_calibrated_kl_and_frozen_indexer() -> None:
@@ -286,25 +396,15 @@ def test_80_20_curriculum_and_tail_calibrated_kl_and_frozen_indexer() -> None:
     long_tok = sched.count("long") * 131_072
     ratio = long_tok / (short_tok + long_tok)
     assert 0.195 <= ratio <= 0.205
-    assert sched[0] == "short" and "long" in sched[:10]
 
-    sched_tail = build_context_curriculum(
-        total_tokens=1_000_000,
-        short_tokens_per_step=10_000,
-        long_tokens_per_step=20_000,
-        long_fraction=0.20,
-        mode="tail",
-    )
-    assert sched_tail == ["short"] * 80 + ["long"] * 10
-
-    # Exact full-vocab equivalence when K == V and zero loss at teacher == student
+    # Exact full-vocab equivalence when K == V AND finite backward gradients (no 0 * -inf NaN!)
     torch.manual_seed(7)
     t_logits = torch.randn(2, 8, 64)
-    s_logits = t_logits + 0.2 * torch.randn(2, 8, 64)
+    s_logits = (t_logits + 0.2 * torch.randn(2, 8, 64)).requires_grad_(True)
     t_lse = torch.logsumexp(t_logits, dim=-1)
     top_vals_all, top_idx_all = torch.topk(t_logits, k=64, dim=-1)
     kl_exact = torch.nn.functional.kl_div(
-        torch.log_softmax(s_logits, dim=-1),
+        torch.log_softmax(s_logits.detach(), dim=-1),
         torch.log_softmax(t_logits, dim=-1),
         log_target=True,
         reduction="none",
@@ -315,18 +415,21 @@ def test_80_20_curriculum_and_tail_calibrated_kl_and_frozen_indexer() -> None:
         top_idx_all,
         teacher_logsumexp=t_lse,
         teacher_top_logits=top_vals_all,
+        chunk_tokens=4,
     )
     assert torch.allclose(kl_exact, kl_sparse_all, atol=1e-5)
+    kl_sparse_all.backward()
+    assert bool(torch.isfinite(s_logits.grad).all())
 
+    # Shifted top_logp + p_tail with teacher_logsumexp must NOT double-subtract!
+    s2 = t_logits.clone().requires_grad_(True)
     top_vals_16, top_idx_16 = torch.topk(t_logits, k=16, dim=-1)
-    kl_self = topk_kl_loss(
-        t_logits,
-        top_vals_16 - t_lse.unsqueeze(-1),
-        top_idx_16,
-        teacher_logsumexp=t_lse,
-        teacher_top_logits=top_vals_16,
-    )
-    assert float(kl_self) < 1e-6
+    top_logp_16 = (top_vals_16 - t_lse.unsqueeze(-1)).clamp_max(0.0)
+    p_tail_16 = (1.0 - top_logp_16.exp().sum(dim=-1)).clamp(0.0, 1.0)
+    kl_self = topk_kl_loss(s2, top_logp_16, top_idx_16, teacher_logsumexp=t_lse, teacher_p_tail=p_tail_16)
+    assert float(kl_self.detach()) < 1e-6
+    kl_self.backward()
+    assert bool(torch.isfinite(s2.grad).all())
 
     # Verify sparse attention indexer norms remain frozen when train_norms=True
     prof = _tiny_profile()

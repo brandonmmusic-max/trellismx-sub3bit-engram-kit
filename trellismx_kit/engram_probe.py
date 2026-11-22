@@ -3,7 +3,8 @@
 Given routed expert outputs y_t and corresponding token sequences, measures
 held-out unigram and bigram explained variance (R^2) and normalized MSE (NMSE)
 per expert. Used to quantify which layers behave as static local n-gram
-lookups versus dynamic contextual transformations.
+lookups versus dynamic contextual transformations and to guide asymmetric
+bit-rate plus Engram co-allocation.
 """
 
 from __future__ import annotations
@@ -33,10 +34,17 @@ def score_expert_ngram_predictability(
     bigram_min_count: int = 2,
 ) -> ExpertPredictability:
     """Evaluate held-out unigram and bigram-backoff mean-table accuracy for one expert."""
+    tok_all = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+    prev_all = np.asarray(prev_token_ids, dtype=np.int64).reshape(-1)
+    build_mask = np.asarray(is_build, dtype=bool).reshape(-1)
+    n = int(outputs.shape[0])
+    if tok_all.shape != (n,) or prev_all.shape != (n,) or build_mask.shape != (n,):
+        raise ValueError("token_ids, prev_token_ids, and is_build must match outputs.shape[0]")
+
     device = outputs.device
     y_all = outputs.float()
-    b_idx = torch.from_numpy(np.nonzero(is_build)[0]).to(device)
-    t_idx = torch.from_numpy(np.nonzero(~is_build)[0]).to(device)
+    b_idx = torch.from_numpy(np.nonzero(build_mask)[0]).to(device)
+    t_idx = torch.from_numpy(np.nonzero(~build_mask)[0]).to(device)
     if b_idx.numel() == 0 or t_idx.numel() == 0:
         raise ValueError("build and held-out splits must both be nonempty")
 
@@ -45,11 +53,11 @@ def score_expert_ngram_predictability(
     d = y_all.shape[-1]
     mu0 = y_b.mean(dim=0)
 
-    tok_b = token_ids[is_build]
-    tok_t = token_ids[~is_build]
-    vocab_stride = int(max(token_ids.max(), prev_token_ids.max(), 1)) + 2
-    bi_b = (prev_token_ids[is_build] + 1) * vocab_stride + tok_b
-    bi_t = (prev_token_ids[~is_build] + 1) * vocab_stride + tok_t
+    tok_b = tok_all[build_mask]
+    tok_t = tok_all[~build_mask]
+    vocab_stride = int(max(int(tok_all.max()), int(prev_all.max()), 1)) + 2
+    bi_b = (prev_all[build_mask] + 1) * np.int64(vocab_stride) + tok_b
+    bi_t = (prev_all[~build_mask] + 1) * np.int64(vocab_stride) + tok_t
 
     uniq_u, inv_u = np.unique(tok_b, return_inverse=True)
     inv_u_t = torch.from_numpy(inv_u).to(device)

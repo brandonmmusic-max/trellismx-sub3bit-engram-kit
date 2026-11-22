@@ -61,9 +61,10 @@ Recommended 35M to 50M token distillation split:
    the sparse long-context retrieval regime.
 
 Because forward-only teacher prefill handles 16K to 64K sequences at full speed
-and sparse top-K logits (`int32` indices + `fp16` values + `fp32` full-vocab
-`logsumexp`) cost the exact same 388 bytes/token (top-64) or 772 bytes/token
-(top-128) at any context length, pre-dumping both short and long distillation
+and sparse top-K shards (`int32` token_ids + `int32` indices + shifted `fp16`
+`top_logp` + `fp32` exact `p_tail` and `logsumexp`) cost 396 bytes/token
+(top-64, ~19.8 GB per 50M tokens) or 780 bytes/token (top-128, ~39.0 GB per
+50M tokens) at any context length, pre-dumping both short and long distillation
 shards plus untouched 8K and 16K to 64K dense evaluation windows takes a single
 forward-only pass.
 
@@ -73,12 +74,16 @@ forward-only pass.
    vector `e_t` before `W_v`; amplifying `e_t` by 50x causes immediate AdamW
    projection divergence. Keep `e_t` unnormalized or scale the projection
    learning rate proportionally.
-2. Keep router weights and sparse attention indexer weights permanently frozen
+2. Promote trainable text-backbone RMSNorm weights to FP32 during distillation;
+   BF16 ULP near 1.0 (`0.0078`) exceeds typical `3e-4` AdamW steps by more than
+   10x and otherwise causes silent update stagnation.
+3. Keep router weights and sparse attention indexer weights permanently frozen
    during QEC distillation so routing decisions and long-context key selection
    cannot destabilize.
-3. Screen every short and long distillation sequence with a 13-gram overlap
+4. Screen every short and long distillation sequence with a 13-gram overlap
    check against every evaluation window so held-out KLD remains an untouched
    measurement.
-4. When distilling from pre-dumped sparse top-K teacher shards, always retain
-   the full-vocabulary `fp32` `logsumexp` per position and include the exact
-   residual tail mass `1 - sum_k p_k` in the KL loss.
+5. Store shifted `top_logp = top_logits - logsumexp` in FP16 plus exact FP32
+   `p_tail` (never raw FP16 `top_logits` subtracted against FP32 `logsumexp`),
+   and compute `log_q_tail` in chunked log-space via masked `logsumexp` so 32K
+   to 64K sequences never OOM or suffer FP32 tail cancellation.
