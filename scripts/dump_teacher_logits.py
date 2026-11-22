@@ -80,12 +80,21 @@ def load_hf_model(
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
 
-        kwargs["distributed_config"] = DistributedConfig(
-            tp_size=world_size,
-            fsdp_size=1,
-            pp_size=1,
-            enable_expert_parallel=True,
-        )
+        try:
+            kwargs["distributed_config"] = DistributedConfig(
+                ep_size=world_size,
+                tp_size=world_size,
+                tp_plan={},
+                fsdp_size=1,
+                pp_size=1,
+            )
+        except TypeError:
+            kwargs["distributed_config"] = DistributedConfig(
+                tp_size=world_size,
+                fsdp_size=1,
+                pp_size=1,
+                enable_expert_parallel=True,
+            )
     else:
         kwargs["device_map"] = "auto"
 
