@@ -635,6 +635,17 @@ def decode_release_layer_experts(
         k in sidecars_by_rank[0].tensors
         for k in ("gate_up_suh_fp16", "down_svh_fp16", "intermediate_scales_fp16")
     )
+    if has_coupled:
+        for rk in range(1, tp_size):
+            for shared_key in ("gate_up_suh_fp16", "down_svh_fp16", "coupled_sign_draw_u8"):
+                if shared_key in sidecars_by_rank[0].tensors:
+                    if not torch.equal(
+                        sidecars_by_rank[0].tensors[shared_key],
+                        sidecars_by_rank[rk].tensors[shared_key],
+                    ):
+                        raise ValueError(
+                            f"rank {rk} {shared_key} disagrees with rank 0 in layer {sidecars_by_rank[0].layer}"
+                        )
     gate_up_suh = sidecars_by_rank[0].tensors["gate_up_suh_fp16"].to(dev) if has_coupled else None
     down_svh = sidecars_by_rank[0].tensors["down_svh_fp16"].to(dev) if has_coupled else None
 

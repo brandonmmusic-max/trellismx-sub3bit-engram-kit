@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from trellismx_kit.glm5_patch import patch_glm5_long_context
+
 try:
     from transformers import AutoModelForImageTextToText
 except ImportError:
@@ -104,7 +106,9 @@ def load_hf_model(
     else:
         kwargs["device_map"] = "auto"
 
-    return loader.from_pretrained(model_path, **kwargs).eval()
+    model = loader.from_pretrained(model_path, **kwargs).eval()
+    patch_glm5_long_context(model)
+    return model
 
 
 def _input_device(model: torch.nn.Module) -> torch.device:
@@ -151,7 +155,7 @@ def dump_dense_eval(
             torch.save(
                 {
                     "token_ids": tokens[idx].to(torch.int32).contiguous(),
-                    "logits": logits.to(dtype=dtype).cpu().contiguous(),
+                    "logits": logits.cpu().to(dtype=dtype).contiguous(),
                 },
                 tmp_path,
             )
@@ -176,6 +180,7 @@ def dump_sparse_split(
     batch_size: int,
     rows_per_shard: int,
     logit_chunk_tokens: int = 2048,
+    vocab_limit: int = 0,
     is_writer: bool = True,
     shard_rank: int = 0,
     shard_world: int = 1,
@@ -207,6 +212,8 @@ def dump_sparse_split(
             b1 = min(shard_end, b0 + batch_size)
             ids = tokens[b0:b1].to(device=dev, dtype=torch.long)
             raw_logits = model(input_ids=ids, use_cache=False).logits[:, :-1]
+            if vocab_limit > 0:
+                raw_logits = raw_logits[:, :, :vocab_limit]
 
             if is_writer:
                 c_idx, c_logp, c_ptail, c_lse = [], [], [], []
@@ -323,6 +330,7 @@ def main() -> None:
             batch_size=args.short_batch_size,
             rows_per_shard=args.rows_per_shard,
             logit_chunk_tokens=args.logit_chunk_tokens,
+            vocab_limit=args.vocab_limit,
             is_writer=is_writer,
             shard_rank=args.shard_rank,
             shard_world=args.shard_world,
@@ -342,6 +350,7 @@ def main() -> None:
                 batch_size=args.long_batch_size,
                 rows_per_shard=args.long_rows_per_shard,
                 logit_chunk_tokens=args.logit_chunk_tokens,
+                vocab_limit=args.vocab_limit,
                 is_writer=is_writer,
                 shard_rank=args.shard_rank,
                 shard_world=args.shard_world,

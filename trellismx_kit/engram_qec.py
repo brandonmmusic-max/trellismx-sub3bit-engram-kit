@@ -76,10 +76,19 @@ def _distinct_primes_below(limit: int, count: int) -> list[int]:
 
 
 def build_nfkc_canon_map(tokenizer: Any, vocab_size: int) -> torch.Tensor:
-    """Build deterministic NFKC + lowercase + space-collapsed token canonicalization LUT."""
+    """Build deterministic NFKC + lowercase + space-collapsed token canonicalization LUT.
+
+    Decodes valid UTF-8 token strings via ``convert_tokens_to_string`` (falling back to
+    ``convert_ids_to_tokens`` only for minimal test stubs) so byte-level BPE lead bytes
+    and incomplete multi-byte fragments are never corrupted by Latin-1 lowercasing.
+    """
+    special_ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
+    has_to_str = callable(getattr(tokenizer, "convert_tokens_to_string", None))
     canon_to_id: dict[str, int] = {}
     mapping = torch.arange(vocab_size, dtype=torch.int64)
     for tid in range(vocab_size):
+        if tid in special_ids:
+            continue
         try:
             piece = tokenizer.convert_ids_to_tokens(tid)
         except Exception:
@@ -90,7 +99,16 @@ def build_nfkc_canon_map(tokenizer: Any, vocab_size: int) -> torch.Tensor:
             piece.startswith("[") and piece.endswith("]")
         ):
             continue
-        s = piece.replace("\u0120", " ").replace("\u2581", " ")
+        if has_to_str:
+            try:
+                decoded = tokenizer.convert_tokens_to_string([piece])
+            except Exception:
+                continue
+            if not isinstance(decoded, str) or "\ufffd" in decoded:
+                continue
+            s = decoded
+        else:
+            s = piece.replace("\u0120", " ").replace("\u2581", " ")
         s = unicodedata.normalize("NFKC", s).lower().strip()
         if not s:
             continue
@@ -754,8 +772,11 @@ class AttentionLoRA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dev = self.a.weight.device
+        # Keep only the rank-r bottleneck in FP32 so large out_features (e.g. lm_head at 64K)
+        # never materialize a 40+ GiB FP32 output tensor.
         x_f = x.to(device=dev, dtype=torch.float32)
-        out = F.linear(F.linear(x_f, self.a.weight.float()), self.b.weight.float()) * self.scale
+        mid = F.linear(x_f, self.a.weight.float()) * self.scale
+        out = F.linear(mid.to(dtype=x.dtype), self.b.weight.to(dtype=x.dtype))
         return out.to(device=x.device, dtype=x.dtype)
 
     @torch.no_grad()
@@ -826,8 +847,10 @@ class FullStackQEC(nn.Module):
         self._lora_handles: list[torch.utils.hooks.RemovableHandle] = []
         self._orig_moe_forwards: dict[int, tuple[nn.Module, Any]] = {}
         self._orig_experts_forwards: dict[int, tuple[nn.Module, Any]] = {}
+        self._orig_norm_forwards: list[tuple[nn.Module, Any, torch.dtype]] = []
         self._promoted_norm_keys: list[str] = []
         self._lora_target_param_keys: list[str] = []
+        self.engram_enabled: bool = True
 
         for p in model.parameters():
             p.requires_grad_(False)
@@ -1023,10 +1046,12 @@ class FullStackQEC(nn.Module):
 
     def _promote_norm_fp32(self, norm_mod: nn.Module) -> None:
         if norm_mod.weight.dtype != torch.float32:
+            orig_weight_dtype = norm_mod.weight.dtype
             norm_mod.weight.data = norm_mod.weight.data.float()
             if getattr(norm_mod, "bias", None) is not None and isinstance(norm_mod.bias, nn.Parameter):
                 norm_mod.bias.data = norm_mod.bias.data.float()
             orig_fwd = norm_mod.forward
+            self._orig_norm_forwards.append((norm_mod, orig_fwd, orig_weight_dtype))
 
             def _fp32_norm_forward(*args, **kwargs):
                 orig_dtype = None
@@ -1087,6 +1112,8 @@ class FullStackQEC(nn.Module):
 
             def make_engram_hook(m: nn.Module, layer_idx: int):
                 def hook(_module, _inp, out):
+                    if not self.engram_enabled:
+                        return out
                     if self.cur_tokens is None:
                         raise RuntimeError("cur_tokens must be set before forward pass")
                     h = out[0] if isinstance(out, tuple) else out
@@ -1199,7 +1226,10 @@ class FullStackQEC(nn.Module):
         if save_route:
             def _record_route(hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor) -> None:
                 with torch.no_grad():
-                    bsz, seq_len = int(hidden_states.shape[0]), int(hidden_states.shape[1])
+                    if self.cur_tokens is not None and self.cur_tokens.ndim == 2:
+                        bsz, seq_len = int(self.cur_tokens.shape[0]), int(self.cur_tokens.shape[1])
+                    else:
+                        bsz, seq_len = int(hidden_states.shape[0]), int(hidden_states.shape[1])
                     rw = torch.zeros(
                         (bsz * seq_len, num_total_experts),
                         device=hidden_states.device,
@@ -1287,11 +1317,29 @@ class FullStackQEC(nn.Module):
         return self
 
     @torch.no_grad()
-    def quantize_engram_tables_inplace(self, table_dtype: torch.dtype) -> dict[str, torch.Tensor]:
-        """Quantize Engram bank/v1 embedding tables in-place (BF16 or FP8 E4M3 dequantized) and return backups."""
+    def finalize_norms_to_carrier_dtype(self) -> int:
+        """Cast trained FP32 norms back to their original carrier dtype and restore stock forward."""
+        restored = 0
+        for norm_mod, orig_fwd, orig_dtype in self._orig_norm_forwards:
+            norm_mod.weight.data = norm_mod.weight.data.to(orig_dtype)
+            if getattr(norm_mod, "bias", None) is not None and isinstance(norm_mod.bias, nn.Parameter):
+                norm_mod.bias.data = norm_mod.bias.data.to(orig_dtype)
+            norm_mod.forward = orig_fwd  # type: ignore[method-assign]
+            restored += 1
+        self._orig_norm_forwards.clear()
+        return restored
+
+    @torch.no_grad()
+    def quantize_engram_tables_inplace(
+        self,
+        table_dtype: torch.dtype,
+        *,
+        quantize_projections_bf16: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Quantize Engram tables (BF16 or FP8 E4M3) and optionally per-layer projections (BF16) in-place."""
         backups: dict[str, torch.Tensor] = {}
 
-        def _qdq(w: torch.Tensor) -> torch.Tensor:
+        def _qdq_table(w: torch.Tensor) -> torch.Tensor:
             if table_dtype == torch.float8_e4m3fn:
                 q, sc = _quantize_fp8_per_row(w)
                 return (q.to(device=w.device, dtype=torch.float32) * sc.to(device=w.device).unsqueeze(-1)).to(w.dtype)
@@ -1302,13 +1350,18 @@ class FullStackQEC(nn.Module):
                 if name.endswith(".weight") and param.ndim == 2:
                     key = f"banks.{bname}.{name}"
                     backups[key] = param.data.detach().cpu().clone()
-                    param.data.copy_(_qdq(param.data))
+                    param.data.copy_(_qdq_table(param.data))
         for lkey, mod in self.engrams.items():
             for name, param in mod.named_parameters():
-                if ("emb" in name) and name.endswith(".weight") and param.ndim == 2:
+                is_v1_emb = ("emb" in name) and name.endswith(".weight") and param.ndim == 2
+                if is_v1_emb:
                     key = f"engrams.{lkey}.{name}"
                     backups[key] = param.data.detach().cpu().clone()
-                    param.data.copy_(_qdq(param.data))
+                    param.data.copy_(_qdq_table(param.data))
+                elif quantize_projections_bf16 and param.is_floating_point():
+                    key = f"engrams.{lkey}.{name}"
+                    backups[key] = param.data.detach().cpu().clone()
+                    param.data.copy_(param.data.detach().to(torch.bfloat16).to(param.dtype))
         return backups
 
     @torch.no_grad()
@@ -1342,12 +1395,12 @@ class FullStackQEC(nn.Module):
 
     @torch.no_grad()
     def merge_lora_into_model(self) -> int:
-        """Fold all LoRA weights into base Linear layers and detach LoRA hooks."""
+        """Fold all LoRA weights into base Linear layers in FP32 and detach LoRA hooks."""
         merged = 0
         for key, proj in self._lora_targets.items():
             adapter = self.loras[key]
-            delta = adapter.delta_weight().to(device=proj.weight.device, dtype=proj.weight.dtype)
-            proj.weight.data.add_(delta)
+            delta = adapter.delta_weight().to(device=proj.weight.device)
+            proj.weight.data.copy_((proj.weight.data.float() + delta).to(dtype=proj.weight.dtype))
             adapter.b.weight.data.zero_()
             merged += 1
         for handle in reversed(self._lora_handles):
@@ -1537,12 +1590,10 @@ def _topk_kl_chunk(
         else:
             p_tail = (1.0 - t_top_p.sum(dim=-1)).clamp_min(0.0)
 
-        mass = t_top_p.sum(dim=-1) + p_tail
-        if bool((mass > 1.0).any()):
-            scale = mass.clamp_min(1.0)
-            t_top_p = t_top_p / scale.unsqueeze(-1)
-            t_top_logp = t_top_p.clamp_min(1e-30).log()
-            p_tail = p_tail / scale
+        scale = (t_top_p.sum(dim=-1) + p_tail).clamp_min(1.0)
+        t_top_p = t_top_p / scale.unsqueeze(-1)
+        t_top_logp = t_top_logp - scale.log().unsqueeze(-1)
+        p_tail = p_tail / scale
 
         s_masked = s_logp.scatter(-1, idx_dev, float("-inf"))
         log_q_tail = torch.logsumexp(s_masked, dim=-1)

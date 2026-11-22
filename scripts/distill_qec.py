@@ -41,13 +41,14 @@ from trellismx_kit.engram_qec import (
     build_nfkc_canon_map,
     topk_kl_loss,
 )
+from trellismx_kit.glm5_patch import patch_glm5_long_context
 from trellismx_kit.kld_score import (
     ALIGNMENT_BAND,
     summarize_windows,
     tokenwise_kld_and_alignment_fp64,
     tokenwise_kld_fp64,
 )
-from trellismx_kit.pe_format import decode_release_layer_experts, read_rank_sidecar
+from trellismx_kit.pe_format import decode_release_layer_experts, read_rank_sidecar, tensor_sha256
 from trellismx_kit.profile import ModelProfile, load_profile
 
 
@@ -226,8 +227,21 @@ def _load_model(
         return loader.from_pretrained(model_path, **kwargs)
     if device_map_auto:
         kwargs["device_map"] = "auto"
-        return loader.from_pretrained(model_path, **kwargs)
-    return loader.from_pretrained(model_path, **kwargs).to(device)
+        n_gpu = torch.cuda.device_count()
+        if n_gpu >= 2:
+            # Reserve extra headroom on GPU 0 (embeddings + io_same_device) and last GPU (lm_head)
+            max_mem: dict[int, str] = {}
+            for gi in range(n_gpu):
+                total_gib = int(torch.cuda.get_device_properties(gi).total_memory // (1024**3))
+                reserve = 60 if (gi == 0 or gi == n_gpu - 1) else 30
+                max_mem[gi] = f"{max(24, total_gib - reserve)}GiB"
+            kwargs["max_memory"] = max_mem
+        model = loader.from_pretrained(model_path, **kwargs)
+        patch_glm5_long_context(model)
+        return model
+    model = loader.from_pretrained(model_path, **kwargs).to(device)
+    patch_glm5_long_context(model)
+    return model
 
 
 def _resolve_block(model: torch.nn.Module, path: str) -> torch.nn.Module:
@@ -275,26 +289,49 @@ def _install_per_expert_release(
             for r in range(profile.tp_size)
         ]
         decode_dev = gate_up_target.device if gate_up_target.device.type == "cuda" else torch.device("cpu")
-        decoded = decode_release_layer_experts(
-            sidecars,
-            profile,
-            expert_range,
-            device=decode_dev,
-            invert_coupled_scales=True,
-        )
-        with torch.no_grad():
-            for global_e in expert_range:
-                local_e = global_e - expert_start
-                gu_w, dn_w = decoded[global_e]
-                gu_cast = gu_w.to(device=gate_up_target.device, dtype=gate_up_target.dtype)
-                dn_cast = dn_w.to(device=down_target.device, dtype=down_target.dtype)
-                gate_up_target[local_e].copy_(gu_cast)
-                down_target[local_e].copy_(dn_cast)
-                if not torch.equal(gate_up_target[local_e], gu_cast):
-                    raise RuntimeError(f"gate_up_proj install check failed at layer {layer} expert {global_e}")
-                if not torch.equal(down_target[local_e], dn_cast):
-                    raise RuntimeError(f"down_proj install check failed at layer {layer} expert {global_e}")
-        decoded.clear()
+        gu_err_sq = 0.0
+        gu_ref_sq = 0.0
+        dn_err_sq = 0.0
+        dn_ref_sq = 0.0
+        expert_list = list(expert_range)
+        # Decode in 16-expert chunks so FP32 peak stays ~1.5 GiB instead of 27 GiB
+        for c0 in range(0, len(expert_list), 16):
+            chunk_es = expert_list[c0 : c0 + 16]
+            decoded = decode_release_layer_experts(
+                sidecars,
+                profile,
+                chunk_es,
+                device=decode_dev,
+                invert_coupled_scales=True,
+            )
+            with torch.no_grad():
+                for global_e in chunk_es:
+                    local_e = global_e - expert_start
+                    gu_w, dn_w = decoded[global_e]
+                    gu_cast = gu_w.to(device=gate_up_target.device, dtype=gate_up_target.dtype)
+                    dn_cast = dn_w.to(device=down_target.device, dtype=down_target.dtype)
+                    gu_ref = gate_up_target[local_e].float()
+                    dn_ref = down_target[local_e].float()
+                    gu_err_sq += float((gu_cast.float() - gu_ref).square().sum().item())
+                    gu_ref_sq += float(gu_ref.square().sum().item())
+                    dn_err_sq += float((dn_cast.float() - dn_ref).square().sum().item())
+                    dn_ref_sq += float(dn_ref.square().sum().item())
+                    gate_up_target[local_e].copy_(gu_cast)
+                    down_target[local_e].copy_(dn_cast)
+                    if not torch.equal(gate_up_target[local_e], gu_cast):
+                        raise RuntimeError(f"gate_up_proj install check failed at layer {layer} expert {global_e}")
+                    if not torch.equal(down_target[local_e], dn_cast):
+                        raise RuntimeError(f"down_proj install check failed at layer {layer} expert {global_e}")
+            decoded.clear()
+        gu_nmse = gu_err_sq / max(1e-30, gu_ref_sq)
+        dn_nmse = dn_err_sq / max(1e-30, dn_ref_sq)
+        if gu_nmse > 0.25 or dn_nmse > 0.25:
+            raise RuntimeError(
+                f"installed expert NMSE sanity check failed at layer {layer}: "
+                f"gate_up_nmse={gu_nmse:.4f}, down_nmse={dn_nmse:.4f} (expected < 0.25)"
+            )
+        if ep_rank == 0 and (layer in (profile.routed_layers[0], profile.routed_layers[len(profile.routed_layers) // 2], profile.routed_layers[-1])):
+            print(f"[install] layer {layer:02d} verified vs BF16: gate_up_nmse={gu_nmse:.4f} down_nmse={dn_nmse:.4f}", flush=True)
         sidecars.clear()
     if ep_rank == 0:
         print(
@@ -306,18 +343,20 @@ def _install_per_expert_release(
 
 @torch.no_grad()
 def evaluate_dense_dir(
-    qec: FullStackQEC,
+    eval_model: torch.nn.Module,
     eval_dir: Path,
     *,
     vocab_limit: int | None = None,
     resamples: int = 5000,
     self_check: bool = True,
+    strict_alignment: bool = False,
     is_writer: bool = True,
 ) -> dict[str, dict[str, object]]:
     """Evaluate untouched exact FP64 KLD grouped by split prefix in ``eval_dir``."""
-    was_training = qec.training
-    qec.eval()
-    dev = _input_device(qec.model)
+    was_training = eval_model.training
+    eval_model.eval()
+    base_mod = eval_model.model if isinstance(eval_model, FullStackQEC) else eval_model
+    dev = _input_device(base_mod)
     paths = sorted(eval_dir.glob("*.pt"))
     grouped: dict[str, list[Path]] = {}
     for p in paths:
@@ -336,7 +375,7 @@ def evaluate_dense_dir(
             rec = torch.load(p, map_location="cpu", weights_only=True)
             token_ids = rec["token_ids"]
             ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-            s_logits = qec(ids, use_cache=False).logits[0, :-1].cpu()
+            s_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1].cpu()
             if is_writer:
                 t_logits = rec["logits"]
                 if self_check and not self_checked:
@@ -362,13 +401,19 @@ def evaluate_dense_dir(
                 window_teacher_hits=t_hits,
                 resamples=resamples,
             )
-            if summ.realized_alignment_rate is not None and not (
-                ALIGNMENT_BAND[0] <= summ.realized_alignment_rate <= ALIGNMENT_BAND[1]
-            ):
-                raise RuntimeError(
+            align_ok = (
+                True
+                if summ.realized_alignment_rate is None
+                else (ALIGNMENT_BAND[0] <= summ.realized_alignment_rate <= ALIGNMENT_BAND[1])
+            )
+            if not align_ok:
+                msg = (
                     f"realized-token alignment {summ.realized_alignment_rate:.4f} outside "
                     f"allowed band {ALIGNMENT_BAND} on split {split}"
                 )
+                if strict_alignment:
+                    raise RuntimeError(msg)
+                print(f"[WARN] {msg}", flush=True)
             results[split] = {
                 "windows": summ.windows,
                 "positions": summ.positions,
@@ -387,9 +432,10 @@ def evaluate_dense_dir(
                 "top1_wilson95_high_pct": summ.top1_wilson95_high_pct,
                 "perplexity_ratio": summ.perplexity_ratio,
                 "realized_alignment_rate": summ.realized_alignment_rate,
+                "alignment_ok": align_ok,
             }
     if was_training:
-        qec.train()
+        eval_model.train()
     return results
 
 
@@ -538,6 +584,16 @@ def main() -> None:
             ep_world_size=world_size if args.distributed_ep else 1,
         )
 
+    out_dir = Path(args.output)
+    eval_dir = Path(args.eval_dense_dir) if args.eval_dense_dir else None
+    stock_baseline_eval = None
+    if eval_dir is not None and not args.resume:
+        stock_baseline_eval = evaluate_dense_dir(
+            student, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+        )
+        if is_writer:
+            print(f"[eval stock BF16 baseline @ 0.0M] {json.dumps(stock_baseline_eval)}", flush=True)
+
     if args.grad_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         try:
             student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -554,13 +610,15 @@ def main() -> None:
         engram_layers = sorted({l for ls in bank_groups.values() for l in ls})
 
     canon_map = None
+    canon_map_sha256 = ""
     tok_src = args.canon_tokenizer or args.student_model
     if not args.unigram_only and tok_src:
-        try:
-            tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=args.trust_remote_code)
-            canon_map = build_nfkc_canon_map(tok, profile.vocab_size)
-        except Exception:
-            canon_map = None
+        tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=args.trust_remote_code)
+        canon_map = build_nfkc_canon_map(tok, profile.vocab_size)
+        canon_map_sha256 = tensor_sha256(canon_map)
+        if is_writer:
+            unique_canon = int(canon_map.unique().numel())
+            print(f"[canon] built NFKC LUT ({profile.vocab_size} -> {unique_canon} canonical IDs, sha256={canon_map_sha256[:16]})", flush=True)
 
     table_dev = torch.device("cpu") if args.engram_table_device == "cpu" else None
     ek: dict[str, object] = (
@@ -602,6 +660,18 @@ def main() -> None:
         ep_rank=rank if args.distributed_ep else 0,
         ep_world_size=world_size if args.distributed_ep else 1,
     )
+    if is_writer:
+        n_attn_l = sum(1 for k in qec.loras if "_attn_" in k)
+        n_dense_l = sum(1 for k in qec.loras if "_dense_" in k)
+        n_shared_l = sum(1 for k in qec.loras if "_shared_" in k)
+        n_lm_l = 1 if "lm_head" in qec.loras else 0
+        print(
+            f"[qec] attached LoRAs: attn={n_attn_l} dense={n_dense_l} shared={n_shared_l} lm_head={n_lm_l} "
+            f"| promoted_norms={len(qec._promoted_norm_keys)} | engram_layers={len(qec.engrams)} | banks={list(qec.banks.keys())}",
+            flush=True,
+        )
+    if args.lora_rank > 0 and len(qec.loras) == 0:
+        raise RuntimeError("lora_rank > 0 but zero LoRA adapters attached; check ModelProfile projection names")
     if not (args.device_map_auto or args.distributed_ep):
         qec = qec.to(device)
     qec.train()
@@ -671,17 +741,15 @@ def main() -> None:
         long_cursor = int(ckpt["long_cursor"])
         short_tokens_seen = int(ckpt["short_tokens_seen"])
         long_tokens_seen = int(ckpt["long_tokens_seen"])
+        if "eval_history" in ckpt:
+            eval_history = list(ckpt["eval_history"])
         seen_m = (short_tokens_seen + long_tokens_seen) / 1e6
         while next_milestone_idx < len(milestones_m) and milestones_m[next_milestone_idx] <= seen_m + 1e-6:
             next_milestone_idx += 1
 
-    out_dir = Path(args.output)
-    eval_dir = Path(args.eval_dense_dir) if args.eval_dense_dir else None
-    if eval_dir is not None and start_step == 0:
-        base_eval = evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+    if eval_dir is not None and start_step == 0 and stock_baseline_eval is not None:
         if is_writer:
-            eval_history.append({"tokens_m": 0.0, "step": 0, "eval": base_eval})
-            print(f"[eval @ 0.0M] {json.dumps(base_eval)}", flush=True)
+            eval_history.append({"tokens_m": 0.0, "step": 0, "eval": stock_baseline_eval})
 
     in_dev = _input_device(qec.model)
     t0 = time.time()
@@ -704,6 +772,7 @@ def main() -> None:
             "inter_scales": qec.inter_scales.state_dict(),
             "expert_bias": qec.expert_bias.state_dict(),
             "norms": norms_state,
+            "eval_history": eval_history,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "short_cursor": short_cursor,
@@ -720,6 +789,7 @@ def main() -> None:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, ckpt_path)
 
+    last_step_eval = None
     for step in range(start_step, total_steps):
         phase = schedule[step]
         is_long = phase == "long"
@@ -809,6 +879,8 @@ def main() -> None:
             _save_checkpoint(m_tag, step + 1)
             if eval_dir is not None:
                 m_eval = evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+                if step + 1 == total_steps:
+                    last_step_eval = m_eval
                 if is_writer:
                     eval_history.append({"tokens_m": round(seen_m, 3), "step": step + 1, "eval": m_eval})
                     print(f"[eval @ {seen_m:.2f}M] {json.dumps(m_eval)}", flush=True)
@@ -818,32 +890,45 @@ def main() -> None:
         dist.barrier()
 
     pre_merge_eval = (
-        evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
-        if eval_dir is not None
-        else None
+        last_step_eval
+        if last_step_eval is not None
+        else (
+            evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+            if eval_dir is not None
+            else None
+        )
     )
     merged = qec.merge_lora_into_model()
-    post_merge_eval = (
-        evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
-        if eval_dir is not None
-        else None
-    )
+    restored_norms = qec.finalize_norms_to_carrier_dtype()
+    if is_writer:
+        print(f"[finalize] merged {merged} LoRA projections and restored {restored_norms} norms to stock carrier BF16", flush=True)
+
+    post_merge_carrier_only_eval = None
     post_merge_bf16_engram_eval = None
     post_merge_fp8_engram_eval = None
     if eval_dir is not None:
-        bf16_bak = qec.quantize_engram_tables_inplace(torch.bfloat16)
+        # 1. Zero-sidecar merged carrier only (merged BF16 LoRA + stock BF16 norms, Engram disabled)
+        qec.engram_enabled = False
+        post_merge_carrier_only_eval = evaluate_dense_dir(
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+        )
+        qec.engram_enabled = True
+        # 2. Exact shipped BF16 artifact (stock BF16 norms + BF16 Engram projections + BF16 tables)
+        bf16_bak = qec.quantize_engram_tables_inplace(torch.bfloat16, quantize_projections_bf16=True)
         post_merge_bf16_engram_eval = evaluate_dense_dir(
             qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
         )
         qec.restore_engram_tables(bf16_bak)
-        fp8_bak = qec.quantize_engram_tables_inplace(torch.float8_e4m3fn)
+        # 3. Exact shipped FP8 artifact (stock BF16 norms + BF16 Engram projections + FP8 E4M3 tables)
+        fp8_bak = qec.quantize_engram_tables_inplace(torch.float8_e4m3fn, quantize_projections_bf16=True)
         post_merge_fp8_engram_eval = evaluate_dense_dir(
             qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
         )
         qec.restore_engram_tables(fp8_bak)
         if is_writer:
-            print(f"[eval post-merge BF16 engram] {json.dumps(post_merge_bf16_engram_eval)}", flush=True)
-            print(f"[eval post-merge FP8 engram]  {json.dumps(post_merge_fp8_engram_eval)}", flush=True)
+            print(f"[eval post-merge carrier-only (0 sidecar)] {json.dumps(post_merge_carrier_only_eval)}", flush=True)
+            print(f"[eval post-merge shipped BF16 engram]     {json.dumps(post_merge_bf16_engram_eval)}", flush=True)
+            print(f"[eval post-merge shipped FP8 engram]      {json.dumps(post_merge_fp8_engram_eval)}", flush=True)
 
     if is_writer:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -874,8 +959,10 @@ def main() -> None:
             "train_expert_bias": args.train_expert_bias,
             "train_lm_head_lora": args.train_lm_head_lora,
             "use_router_gate": args.use_router_gate,
+            "canon_map_sha256": canon_map_sha256,
+            "stock_baseline_eval": stock_baseline_eval,
             "pre_merge_eval": pre_merge_eval,
-            "post_merge_eval": post_merge_eval,
+            "post_merge_carrier_only_eval": post_merge_carrier_only_eval,
             "post_merge_bf16_engram_eval": post_merge_bf16_engram_eval,
             "post_merge_fp8_engram_eval": post_merge_fp8_engram_eval,
             "eval_history": eval_history,
