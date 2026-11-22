@@ -21,9 +21,12 @@ from trellismx_kit.allocate import (
 from trellismx_kit.engram_probe import score_expert_ngram_predictability
 from trellismx_kit.engram_qec import (
     AttentionLoRA,
+    DualTrellisEngramLayer,
     EngramQECLayer,
     FullStackQEC,
+    SharedHostNGramBank,
     build_context_curriculum,
+    build_nfkc_canon_map,
     topk_kl_loss,
 )
 from trellismx_kit.kld_score import summarize_windows, tokenwise_kld_fp64
@@ -438,4 +441,215 @@ def test_80_20_curriculum_and_tail_calibrated_kl_and_frozen_indexer() -> None:
     qec = FullStackQEC(model, prof, engram_layers=(0,), lora_rank=4, train_norms=True)
     assert not model.model.layers[0].self_attn.indexer_norm.weight.requires_grad
     assert model.model.layers[0].norm.weight.requires_grad
+    qec.remove_hooks()
+
+
+class _Tiny3DExperts(nn.Module):
+    def __init__(self, num_experts: int, hidden: int, inter: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.swiglu_limit = 10.0
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * inter, hidden) * 0.05)
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, inter) * 0.05)
+
+    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(hidden_states)
+        for e in range(self.num_experts):
+            pos, tok = torch.where(top_k_index.t() == e)
+            if tok.numel() == 0:
+                continue
+            gu = torch.nn.functional.linear(hidden_states[tok], self.gate_up_proj[e])
+            g, u = gu.chunk(2, dim=-1)
+            act = torch.nn.functional.silu(g.clamp(max=self.swiglu_limit)) * u.clamp(-self.swiglu_limit, self.swiglu_limit)
+            y = torch.nn.functional.linear(act, self.down_proj[e]) * top_k_weights[tok, pos, None]
+            out.index_add_(0, tok, y.to(out.dtype))
+        return out
+
+
+class _TinyGlmStyleMoE(nn.Module):
+    def __init__(self, hidden: int, inter: int, num_experts: int, top_k: int) -> None:
+        super().__init__()
+        self.top_k = top_k
+        self.router_w = nn.Linear(hidden, num_experts, bias=False)
+        self.experts = _Tiny3DExperts(num_experts, hidden, inter)
+        self.shared_experts = nn.Module()
+        self.shared_experts.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.shared_experts.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.shared_experts.down_proj = nn.Linear(inter, hidden, bias=False)
+        self.shared_experts.forward = lambda x: self.shared_experts.down_proj(
+            torch.nn.functional.silu(self.shared_experts.gate_proj(x)) * self.shared_experts.up_proj(x)
+        )
+
+    def gate(self, hidden_states: torch.Tensor):
+        logits = self.router_w(hidden_states.reshape(-1, hidden_states.shape[-1]))
+        probs = torch.softmax(logits.float(), dim=-1)
+        w, idx = torch.topk(probs, k=self.top_k, dim=-1)
+        return logits, w.to(hidden_states.dtype), idx
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig = hidden_states.shape
+        _, w, idx = self.gate(hidden_states)
+        out = self.experts(hidden_states.reshape(-1, orig[-1]), idx, w).view(*orig)
+        return out + self.shared_experts(hidden_states)
+
+
+class _TinyMHCBlock(nn.Module):
+    """Simulates a 4-stream hyper-connection decoder layer (like GLM-5.3 Flash)."""
+
+    def __init__(self, d: int, inter: int, num_experts: int, top_k: int) -> None:
+        super().__init__()
+        self.ffn_hc = nn.Identity()
+        self.self_attn = nn.Module()
+        self.self_attn.q_proj = nn.Linear(d, d, bias=False)
+        self.self_attn.k_proj = nn.Linear(d, d, bias=False)
+        self.self_attn.v_proj = nn.Linear(d, d, bias=False)
+        self.self_attn.o_proj = nn.Linear(d, d, bias=False)
+        self.mlp = _TinyGlmStyleMoE(d, inter, num_experts, top_k)
+        self.input_layernorm = nn.LayerNorm(d)
+
+    def forward(self, h4: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # h4: [B, T, 4, D]
+        x = self.input_layernorm(h4.mean(dim=-2))
+        a = self.self_attn.o_proj(self.self_attn.q_proj(x) + self.self_attn.k_proj(x) + self.self_attn.v_proj(x))
+        m = self.mlp(x + 0.1 * a)
+        return h4 + 0.1 * m.unsqueeze(-2), None
+
+
+class _TinyMHCModel(nn.Module):
+    def __init__(self, d: int, inter: int, v: int, n_layers: int, num_experts: int, top_k: int) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(v, d)
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList(
+            [_TinyMHCBlock(d, inter, num_experts, top_k) for _ in range(n_layers)]
+        )
+        self.model.language_model.norm = nn.LayerNorm(d)
+        self.lm_head = nn.Linear(d, v, bias=False)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def forward(self, input_ids: torch.Tensor, **_kwargs) -> torch.Tensor:
+        h = self.embed(input_ids).unsqueeze(-2).expand(-1, -1, 4, -1).contiguous()
+        for blk in self.model.language_model.layers:
+            h, _ = blk(h)
+        return self.lm_head(self.model.language_model.norm(h.mean(dim=-2)))
+
+
+def test_dual_trellis_v2_shared_banks_mhc_inter_scales_bias_lm_head_and_fp8_export() -> None:
+    torch.manual_seed(13)
+    prof = ModelProfile(
+        name="synthetic-mhc-moe",
+        hidden_size=64,
+        intermediate_size=64,
+        num_layers=4,
+        routed_layers=(0, 1, 2, 3),
+        num_experts=4,
+        top_k=2,
+        vocab_size=128,
+        tp_size=2,
+        rates=("k2", "p25", "k3", "k4"),
+        non_routed_params=50_000,
+        layer_path_template="model.language_model.layers.{layer}",
+        moe_attr="mlp",
+        attn_attr="self_attn",
+        shared_expert_attr="shared_experts",
+        tie_word_embeddings=False,
+    )
+    model = _TinyMHCModel(64, 64, 128, 4, 4, 2).to(torch.bfloat16)
+    ids = torch.randint(0, 128, (2, 12))
+    with torch.no_grad():
+        base_out = model(ids).clone()
+
+    class _FakeTok:
+        def convert_ids_to_tokens(self, tid: int) -> str:
+            return f"\u0120Tok{tid % 32}" if tid > 1 else "<bos>"
+
+    canon = build_nfkc_canon_map(_FakeTok(), 128)
+    assert int(canon[0]) == 0 and int(canon[34]) == int(canon[2])
+
+    qec = FullStackQEC(
+        model,
+        prof,
+        engram_mode="v2_shared_banks",
+        engram_bank_groups={"early": [0, 1], "late": [2, 3]},
+        lora_rank=4,
+        engram_kwargs={
+            "d_uni": 16,
+            "d_bi": 8,
+            "n_bi_heads": 2,
+            "d_tri": 8,
+            "n_tri_heads": 1,
+            "d_skip": 8,
+            "n_skip_heads": 1,
+            "buckets": 131,
+            "canon_map": canon,
+            "table_device": "cpu",
+        },
+        train_norms=True,
+        train_shared_lora=True,
+        train_lm_head_lora=True,
+        train_inter_scales=True,
+        train_expert_bias=True,
+        use_router_gate=True,
+    )
+    assert "lm_head" in qec.loras
+    assert len(qec.banks) == 2 and len(qec.engrams) == 4
+    assert len(qec.inter_scales) == 4 and len(qec.expert_bias) == 4
+
+    # SharedHostNGramBank T == 1 and prev_tokens continuity
+    b0 = qec.banks["early"]
+    u1, bi1, tri1, sk1 = b0.lookup(ids[:, 2:3], prev_tokens=ids[:, 0:2])
+    uf, bif, trif, skf = b0.lookup(ids[:, :3])
+    assert torch.allclose(u1[:, 0], uf[:, 2], atol=1e-6)
+    assert bi1 is not None and bif is not None and torch.allclose(bi1[:, 0], bif[:, 2], atol=1e-6)
+    assert tri1 is not None and trif is not None and torch.allclose(tri1[:, 0], trif[:, 2], atol=1e-6)
+    assert sk1 is not None and skf is not None and torch.allclose(sk1[:, 0], skf[:, 2], atol=1e-6)
+
+    # Zero-init matches baseline on 4-stream mHC model
+    qec.eval()
+    with torch.no_grad():
+        zero_out = qec(ids)
+    assert torch.allclose(zero_out.float(), base_out.float(), atol=2e-2)
+
+    # Gradients flow into shared banks, per-layer projections, router gate, inter_scales, expert_bias, lm_head LoRA, norms
+    qec.train()
+    opt = torch.optim.AdamW(qec.parameter_groups())
+    target_logits = base_out.detach().float() + 0.5 * torch.randn_like(base_out.float())
+    t_lse = torch.logsumexp(target_logits, dim=-1)
+    top_vals, top_idx = torch.topk(target_logits, k=16, dim=-1)
+    top_logp = (top_vals - t_lse.unsqueeze(-1)).clamp_max(0.0)
+    p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
+    for _ in range(2):
+        opt.zero_grad()
+        loss = topk_kl_loss(qec(ids), top_logp, top_idx, teacher_p_tail=p_tail, chunk_tokens=6)
+        loss.backward()
+        opt.step()
+
+    assert float(qec.inter_scales["0"].grad.abs().sum()) > 0.0
+    assert float(qec.expert_bias["0"].grad.abs().sum()) > 0.0
+    assert float(qec.loras["lm_head"].a.weight.grad.abs().sum()) > 0.0
+    assert float(qec.banks["early"].bi_embs[0].weight.grad.abs().sum()) > 0.0
+    assert isinstance(qec.engrams["0"], DualTrellisEngramLayer)
+    assert qec.engrams["0"].route_gate_w is not None
+    assert float(qec.engrams["0"].route_gate_w.grad.abs().sum()) > 0.0
+
+    # Merge parity + BF16/FP8 sidecar export
+    qec.eval()
+    with torch.no_grad():
+        pre_merge = qec(ids).clone()
+    qec.merge_lora_into_model()
+    with torch.no_grad():
+        post_merge = qec(ids)
+    assert torch.allclose(pre_merge.float(), post_merge.float(), atol=5e-2)
+
+    bf16_sc = qec.export_engram_sidecar(table_dtype=torch.bfloat16)
+    fp8_sc = qec.export_engram_sidecar(table_dtype=torch.float8_e4m3fn)
+    assert bf16_sc["banks"]["early"]["uni_emb.weight"].dtype == torch.bfloat16
+    assert fp8_sc["banks"]["early"]["uni_emb.weight"].dtype == torch.float8_e4m3fn
+    assert "uni_emb.weight.row_scale" in fp8_sc["banks"]["early"]
+    eqec = qec.export_expert_qec_state()
+    assert eqec["layer_0.intermediate_scales_fp16"].dtype == torch.float16
+    assert eqec["layer_0.expert_bias_bf16"].dtype == torch.bfloat16
     qec.remove_hooks()
