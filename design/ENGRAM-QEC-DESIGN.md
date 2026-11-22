@@ -42,14 +42,43 @@ text stream:
      runtime prefetches all required table rows from host DDR5 before Layer 0
      begins (a few kilobytes per token per layer, hidden behind GPU compute).
 
+## Context-length curriculum (80/20 short-to-long split)
+
+Host-RAM n-gram tables depend only on local `(t_{i-2}, t_{i-1}, t_i)` triples
+and saturate fastest on high-throughput 2K to 4K sequences. Mergeable Attention
+LoRA and Engram context gates, however, must also calibrate across long-context
+attention distributions, especially on architectures with sparse indexed
+attention (for example, `index_topk = 2048` on GLM-5.3 Flash) where behavior
+transitions from dense attention to sparse top-K key retrieval past 2K tokens.
+
+Recommended 35M to 50M token distillation split:
+
+1. 80% short-context sequences (2K to 4K tokens): maximizes tokens/sec during
+   backward and saturates prime-hashed bigram and trigram buckets.
+2. 20% long-context sequences (16K to 32K tokens, plus an optional 1M to 2M
+   token 64K tail when activation checkpointing fits comfortably in VRAM):
+   calibrates Attention LoRA (`q`, `k`, `v`, `o`) and Engram context gates in
+   the sparse long-context retrieval regime.
+
+Because forward-only teacher prefill handles 16K to 64K sequences at full speed
+and sparse top-K logits (`int32` indices + `fp16` values + `fp32` full-vocab
+`logsumexp`) cost the exact same 388 bytes/token (top-64) or 772 bytes/token
+(top-128) at any context length, pre-dumping both short and long distillation
+shards plus untouched 8K and 16K to 64K dense evaluation windows takes a single
+forward-only pass.
+
 ## Stability invariants
 
 1. Do not apply RMSNorm directly to the small-std (`0.02`) concatenated lookup
    vector `e_t` before `W_v`; amplifying `e_t` by 50x causes immediate AdamW
    projection divergence. Keep `e_t` unnormalized or scale the projection
    learning rate proportionally.
-2. Keep router weights frozen during QEC distillation unless using a very small
-   learning rate (`<= 1e-5`) on large token counts; aggressive router updates
-   degrade held-out KLD.
-3. Screen the distillation stream with a 13-gram overlap check against every
-   evaluation window so held-out KLD remains an untouched measurement.
+2. Keep router weights and sparse attention indexer weights permanently frozen
+   during QEC distillation so routing decisions and long-context key selection
+   cannot destabilize.
+3. Screen every short and long distillation sequence with a 13-gram overlap
+   check against every evaluation window so held-out KLD remains an untouched
+   measurement.
+4. When distilling from pre-dumped sparse top-K teacher shards, always retain
+   the full-vocabulary `fp32` `logsumexp` per position and include the exact
+   residual tail mass `1 - sum_k p_k` in the KL loss.

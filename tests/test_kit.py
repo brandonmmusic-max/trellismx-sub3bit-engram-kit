@@ -15,7 +15,13 @@ from trellismx_kit.allocate import (
     build_hierarchical_assignment,
 )
 from trellismx_kit.engram_probe import score_expert_ngram_predictability
-from trellismx_kit.engram_qec import AttentionLoRA, EngramQECLayer, FullStackQEC, topk_kl_loss
+from trellismx_kit.engram_qec import (
+    AttentionLoRA,
+    EngramQECLayer,
+    FullStackQEC,
+    build_context_curriculum,
+    topk_kl_loss,
+)
 from trellismx_kit.kld_score import summarize_windows, tokenwise_kld_fp64
 from trellismx_kit.pe_format import (
     decode_csf_plane,
@@ -266,3 +272,67 @@ def test_engram_probe_and_kld_and_vram_budget() -> None:
     prof_1t = load_profile(REPO_ROOT / "configs" / "template-1t-moe.json")
     est = estimate_memory(prof_1t, avg_expert_bits=2.25, gpu_count=4)
     assert est.kv_headroom_per_gpu_gib > 10.0
+
+
+def test_80_20_curriculum_and_tail_calibrated_kl_and_frozen_indexer() -> None:
+    sched = build_context_curriculum(
+        total_tokens=50_000_000,
+        short_tokens_per_step=65_536,
+        long_tokens_per_step=131_072,
+        long_fraction=0.20,
+        mode="interleaved",
+    )
+    short_tok = sched.count("short") * 65_536
+    long_tok = sched.count("long") * 131_072
+    ratio = long_tok / (short_tok + long_tok)
+    assert 0.195 <= ratio <= 0.205
+    assert sched[0] == "short" and "long" in sched[:10]
+
+    sched_tail = build_context_curriculum(
+        total_tokens=1_000_000,
+        short_tokens_per_step=10_000,
+        long_tokens_per_step=20_000,
+        long_fraction=0.20,
+        mode="tail",
+    )
+    assert sched_tail == ["short"] * 80 + ["long"] * 10
+
+    # Exact full-vocab equivalence when K == V and zero loss at teacher == student
+    torch.manual_seed(7)
+    t_logits = torch.randn(2, 8, 64)
+    s_logits = t_logits + 0.2 * torch.randn(2, 8, 64)
+    t_lse = torch.logsumexp(t_logits, dim=-1)
+    top_vals_all, top_idx_all = torch.topk(t_logits, k=64, dim=-1)
+    kl_exact = torch.nn.functional.kl_div(
+        torch.log_softmax(s_logits, dim=-1),
+        torch.log_softmax(t_logits, dim=-1),
+        log_target=True,
+        reduction="none",
+    ).sum(dim=-1).mean()
+    kl_sparse_all = topk_kl_loss(
+        s_logits,
+        top_vals_all - t_lse.unsqueeze(-1),
+        top_idx_all,
+        teacher_logsumexp=t_lse,
+        teacher_top_logits=top_vals_all,
+    )
+    assert torch.allclose(kl_exact, kl_sparse_all, atol=1e-5)
+
+    top_vals_16, top_idx_16 = torch.topk(t_logits, k=16, dim=-1)
+    kl_self = topk_kl_loss(
+        t_logits,
+        top_vals_16 - t_lse.unsqueeze(-1),
+        top_idx_16,
+        teacher_logsumexp=t_lse,
+        teacher_top_logits=top_vals_16,
+    )
+    assert float(kl_self) < 1e-6
+
+    # Verify sparse attention indexer norms remain frozen when train_norms=True
+    prof = _tiny_profile()
+    model = _TinyModel(prof.hidden_size, prof.vocab_size, prof.num_layers)
+    model.model.layers[0].self_attn.indexer_norm = nn.LayerNorm(prof.hidden_size)
+    qec = FullStackQEC(model, prof, engram_layers=(0,), lora_rank=4, train_norms=True)
+    assert not model.model.layers[0].self_attn.indexer_norm.weight.requires_grad
+    assert model.model.layers[0].norm.weight.requires_grad
+    qec.remove_hooks()

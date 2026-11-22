@@ -48,7 +48,8 @@ Target deployment envelope: fitting 1T+ parameter MoE checkpoints onto four
 | `trellismx_kit/engram_probe.py` | Training-free n-gram predictability (`R^2`, NMSE) diagnostic | implemented |
 | `trellismx_kit/kld_score.py` | Exact FP64 full-vocabulary KL scorer and window-block bootstrap CI | implemented |
 | `trellismx_kit/vram_budget.py` | GPU VRAM and host-RAM sizing calculator | implemented |
-| `scripts/distill_qec.py` | Model-neutral DDP CLI for Full-Stack QEC distillation and LoRA merge | implemented |
+| `scripts/distill_qec.py` | Model-neutral DDP CLI for Full-Stack QEC (80/20 short/long curriculum, live or sparse shards) | implemented |
+| `scripts/dump_teacher_logits.py` | Forward-only dumper for dense eval logits and sparse top-K + logsumexp shards | implemented |
 | `design/` | Format, four-rate P8 kernel, and Engram QEC specifications | implemented |
 | `patches/` | `b12x-per-expert.patch` (qualified on SM120 synthetic layers for `{k2, p25, k3, k4}`), `kquant-pair.patch`, `flare-per-expert.patch` | SM120 kernel verified |
 | `results/` | Machine-readable JSON summary of Granite 3.1 3B empirical sweeps | qualified on Granite 3B |
