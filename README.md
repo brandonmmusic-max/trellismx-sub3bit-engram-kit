@@ -65,6 +65,7 @@ Target deployment envelope: fitting 1T+ parameter MoE checkpoints onto four
 | `results/` | Machine-readable JSON summary of Granite 3.1 3B empirical sweeps | qualified on Granite 3B |
 | `RESULTS.md` | Full Granite 3.1 3B empirical measurements (per-expert, zero-train LUT, 10M and 50M QEC) | qualified on Granite 3B |
 | `AGENT_RUNBOOK.md` | Step-by-step workflow for quantizing an arbitrary MoE checkpoint | implemented |
+| `LAMBDA_100M_PLAN.md` | Complete 100M-token GLM-5.3 Flash Lambda execution plan targeting DGX Spark 128 GB | implemented |
 | `tests/test_kit.py` | CPU unit and invariant test suite (`pytest`) | implemented |
 
 ## Quick check

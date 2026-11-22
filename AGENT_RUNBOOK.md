@@ -153,12 +153,15 @@ Recommended token and bucket budgets (35M to 50M base for frontier MoEs):
 1. Fast local sanity check / ablation: 10M tokens (already captures >85% of the
    gain on 40-expert models like Granite 3.1 3B, useful for validating loss
    curves before launching a full run).
-2. Production 288+ expert MoE (GLM-5.3 Flash, 1T+ MoE): **35M to 50M tokens**
-   (dump 50M once on the high-VRAM teacher node: 40M short at 4K + 10M long at
-   16K to 32K). Higher expert sparsity (288 vs 40 experts) reduces per-expert
-   token hits by 7.2x, so 35M to 50M tokens is required to converge both the
-   74M+ `intermediate_scales_fp16` codebook gains and the 3 shared host-RAM
-   depth banks (`524287` prime buckets per bigram/trigram/skip head).
+2. Production 288+ expert MoE (GLM-5.3 Flash, 1T+ MoE): **50M to 100M tokens**
+   (75M to 100M is optimal when running on an 8x H200 or 8x B200 node: 80M
+   short at 4K + 20M long at 16K to 32K with `1,048,573` prime buckets across
+   3 shared host-RAM depth banks; use 50M with `524,287` buckets under tighter
+   2 to 3 hour windows). Higher expert sparsity (288 vs 40 experts) reduces
+   per-expert token hits by 7.2x, so 50M to 100M tokens is required to converge
+   both the 74M+ `intermediate_scales_fp16` codebook gains and the shared
+   host-RAM hash tables. See `LAMBDA_100M_PLAN.md` for the complete single-node
+   8x H200 / 8x B200 schedule and DGX Spark 128 GB footprint table.
 3. Keep router weights and sparse attention indexers permanently frozen during
    QEC distillation, and keep text-backbone RMSNorm weights promoted to FP32.
 
