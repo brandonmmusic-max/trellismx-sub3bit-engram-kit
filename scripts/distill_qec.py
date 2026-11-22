@@ -41,7 +41,13 @@ from trellismx_kit.engram_qec import (
     build_nfkc_canon_map,
     topk_kl_loss,
 )
-from trellismx_kit.kld_score import summarize_windows, tokenwise_kld_fp64
+from trellismx_kit.kld_score import (
+    ALIGNMENT_BAND,
+    summarize_windows,
+    tokenwise_kld_and_alignment_fp64,
+    tokenwise_kld_fp64,
+)
+from trellismx_kit.pe_format import decode_release_layer_experts, read_rank_sidecar
 from trellismx_kit.profile import ModelProfile, load_profile
 
 
@@ -56,6 +62,18 @@ class _ShardStream:
         self._row_idx = 0
         self._cur = self._load(0)
         self.seq_len = int(self._cur["token_ids"].shape[1])
+        self.total_rows = sum(
+            int(torch.load(p, map_location="cpu", weights_only=True)["token_ids"].shape[0])
+            for p in self.paths
+        )
+
+    def state_dict(self) -> dict[str, int]:
+        return {"shard_idx": self._shard_idx, "row_idx": self._row_idx}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self._shard_idx = int(state["shard_idx"])
+        self._row_idx = int(state["row_idx"])
+        self._cur = self._load(self._shard_idx)
 
     def _load(self, index: int) -> dict[str, torch.Tensor]:
         path = self.paths[index % len(self.paths)]
@@ -111,25 +129,35 @@ class _MultiLengthShardStream:
         self.streams = [_ShardStream(d) for d in shard_dirs]
         if not self.streams:
             raise ValueError("at least one shard directory is required")
-        # Interleave shard directories proportionally by shard count so every milestone sees all lengths
-        counts = [max(1, len(st.paths)) for st in self.streams]
-        total = sum(counts)
+        # Interleave shard directories proportionally by actual row count so every milestone sees all lengths
+        counts = [max(1, st.total_rows) for st in self.streams]
+        g = math.gcd(*counts)
+        weights = [c // g for c in counts]
+        total = sum(weights)
         placed = [0] * len(self.streams)
         self.schedule: list[int] = []
         for step in range(total):
             best_i = max(
                 range(len(self.streams)),
-                key=lambda i: ((step + 1) * counts[i]) / total - placed[i],
+                key=lambda i: ((step + 1) * weights[i]) / total - placed[i],
             )
             self.schedule.append(best_i)
             placed[best_i] += 1
         self._pos = 0
         self.seq_len = int(
             round(
-                sum(st.seq_len * max(1, len(st.paths)) for st in self.streams)
-                / max(1, len(self.schedule))
+                sum(st.seq_len * st.total_rows for st in self.streams)
+                / max(1, sum(st.total_rows for st in self.streams))
             )
         )
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"pos": self._pos, "streams": [st.state_dict() for st in self.streams]}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self._pos = int(state["pos"])
+        for st, sub in zip(self.streams, state["streams"], strict=True):
+            st.load_state_dict(sub)
 
     def take(
         self, count: int
@@ -202,6 +230,15 @@ def _load_model(
     return loader.from_pretrained(model_path, **kwargs).to(device)
 
 
+def _resolve_block(model: torch.nn.Module, path: str) -> torch.nn.Module:
+    obj: object = model
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)  # type: ignore[index]
+    if not isinstance(obj, torch.nn.Module):
+        raise TypeError(f"{path!r} did not resolve to an nn.Module")
+    return obj
+
+
 def _install_per_expert_release(
     model: torch.nn.Module,
     profile: ModelProfile,
@@ -210,33 +247,61 @@ def _install_per_expert_release(
     ep_rank: int = 0,
     ep_world_size: int = 1,
 ) -> None:
-    """Decode per-expert TP rank sidecars and overwrite routed experts in-place."""
-    from glm53kit.kit.kld.capture_student import install_expert_weights, load_release_experts
-
+    """Decode four-rate CSF TP rank sidecars, invert coupled scales, and overwrite routed experts."""
     local_count = profile.num_experts // ep_world_size
     expert_start = ep_rank * local_count
     expert_range = range(expert_start, expert_start + local_count)
+    sidecar_root = release_dir / "sidecars"
+    t0 = time.time()
     for layer in profile.routed_layers:
-        decoded = load_release_experts(
-            release_dir,
-            layer,
+        block = _resolve_block(model, profile.layer_path_template.format(layer=layer))
+        moe = getattr(block, profile.moe_attr)
+        experts = moe.experts
+        gate_up_target = (
+            experts.gate_up_proj.to_local()
+            if hasattr(experts.gate_up_proj, "to_local")
+            else experts.gate_up_proj
+        )
+        down_target = (
+            experts.down_proj.to_local()
+            if hasattr(experts.down_proj, "to_local")
+            else experts.down_proj
+        )
+        sidecars = [
+            read_rank_sidecar(
+                sidecar_root / f"p8-layer-{layer:03d}-tp{profile.tp_size}-rank-{r}.safetensors",
+                profile,
+            )
+            for r in range(profile.tp_size)
+        ]
+        decode_dev = gate_up_target.device if gate_up_target.device.type == "cuda" else torch.device("cpu")
+        decoded = decode_release_layer_experts(
+            sidecars,
+            profile,
             expert_range,
-            hidden=profile.hidden_size,
-            intermediate=profile.intermediate_size,
-            tp_size=profile.tp_size,
+            device=decode_dev,
+            invert_coupled_scales=True,
         )
-        weights = {(layer, e): decoded[e] for e in expert_range}
-        install_expert_weights(
-            model,
-            weights,
-            world_size=ep_world_size,
-            rank=ep_rank,
-            expert_count=profile.num_experts,
-            hidden=profile.hidden_size,
-            intermediate=profile.intermediate_size,
-            layers=(layer,),
+        with torch.no_grad():
+            for global_e in expert_range:
+                local_e = global_e - expert_start
+                gu_w, dn_w = decoded[global_e]
+                gu_cast = gu_w.to(device=gate_up_target.device, dtype=gate_up_target.dtype)
+                dn_cast = dn_w.to(device=down_target.device, dtype=down_target.dtype)
+                gate_up_target[local_e].copy_(gu_cast)
+                down_target[local_e].copy_(dn_cast)
+                if not torch.equal(gate_up_target[local_e], gu_cast):
+                    raise RuntimeError(f"gate_up_proj install check failed at layer {layer} expert {global_e}")
+                if not torch.equal(down_target[local_e], dn_cast):
+                    raise RuntimeError(f"down_proj install check failed at layer {layer} expert {global_e}")
+        decoded.clear()
+        sidecars.clear()
+    if ep_rank == 0:
+        print(
+            f"[install] Decoded and installed {len(profile.routed_layers)} routed layers "
+            f"from {release_dir} in {time.time() - t0:.1f}s",
+            flush=True,
         )
-        weights.clear()
 
 
 @torch.no_grad()
@@ -244,6 +309,9 @@ def evaluate_dense_dir(
     qec: FullStackQEC,
     eval_dir: Path,
     *,
+    vocab_limit: int | None = None,
+    resamples: int = 5000,
+    self_check: bool = True,
     is_writer: bool = True,
 ) -> dict[str, dict[str, object]]:
     """Evaluate untouched exact FP64 KLD grouped by split prefix in ``eval_dir``."""
@@ -260,18 +328,47 @@ def evaluate_dense_dir(
     for split, split_paths in grouped.items():
         klds: list[torch.Tensor] = []
         agrees: list[torch.Tensor] = []
+        t_lps: list[torch.Tensor] = []
+        s_lps: list[torch.Tensor] = []
+        t_hits: list[torch.Tensor] = []
+        self_checked = False
         for p in split_paths:
             rec = torch.load(p, map_location="cpu", weights_only=True)
-            ids = rec["token_ids"].unsqueeze(0).to(device=dev, dtype=torch.long)
+            token_ids = rec["token_ids"]
+            ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
             s_logits = qec(ids, use_cache=False).logits[0, :-1].cpu()
             if is_writer:
                 t_logits = rec["logits"]
-                kld, agree = tokenwise_kld_fp64(t_logits, s_logits)
+                if self_check and not self_checked:
+                    self_kld, _ = tokenwise_kld_fp64(t_logits, t_logits, vocab_limit=vocab_limit)
+                    if float(self_kld.max().item()) != 0.0:
+                        raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
+                    self_checked = True
+                kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
+                    t_logits, s_logits, token_ids[1:], vocab_limit=vocab_limit
+                )
                 klds.append(kld)
                 agrees.append(agree)
+                t_lps.append(t_lp)
+                s_lps.append(s_lp)
+                t_hits.append(hit)
             del ids, s_logits
         if is_writer and klds:
-            summ = summarize_windows(klds, agrees, resamples=1000)
+            summ = summarize_windows(
+                klds,
+                agrees,
+                window_teacher_logp=t_lps,
+                window_student_logp=s_lps,
+                window_teacher_hits=t_hits,
+                resamples=resamples,
+            )
+            if summ.realized_alignment_rate is not None and not (
+                ALIGNMENT_BAND[0] <= summ.realized_alignment_rate <= ALIGNMENT_BAND[1]
+            ):
+                raise RuntimeError(
+                    f"realized-token alignment {summ.realized_alignment_rate:.4f} outside "
+                    f"allowed band {ALIGNMENT_BAND} on split {split}"
+                )
             results[split] = {
                 "windows": summ.windows,
                 "positions": summ.positions,
@@ -279,9 +376,17 @@ def evaluate_dense_dir(
                 "median_kld": summ.median_kld,
                 "p90_kld": summ.p90_kld,
                 "p99_kld": summ.p99_kld,
+                "p99_9_kld": summ.p99_9_kld,
+                "max_kld": summ.max_kld,
                 "ci95_low": summ.ci95_low,
                 "ci95_high": summ.ci95_high,
-                "top1_agreement": summ.top1_agreement,
+                "percentile_ci95_low": summ.percentile_ci95_low,
+                "percentile_ci95_high": summ.percentile_ci95_high,
+                "top1_agreement_pct": summ.top1_agreement_pct,
+                "top1_wilson95_low_pct": summ.top1_wilson95_low_pct,
+                "top1_wilson95_high_pct": summ.top1_wilson95_high_pct,
+                "perplexity_ratio": summ.perplexity_ratio,
+                "realized_alignment_rate": summ.realized_alignment_rate,
             }
     if was_training:
         qec.train()
@@ -358,6 +463,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     profile = load_profile(args.profile)
 
     use_shards = bool(args.teacher_shards)
@@ -431,7 +539,12 @@ def main() -> None:
         )
 
     if args.grad_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
-        student.gradient_checkpointing_enable()
+        try:
+            student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            student.gradient_checkpointing_enable()
+        if hasattr(student, "config"):
+            student.config.use_cache = False
         if hasattr(student, "enable_input_require_grads"):
             student.enable_input_require_grads()
 
@@ -493,6 +606,8 @@ def main() -> None:
         qec = qec.to(device)
     qec.train()
 
+    if distributed and (not args.device_map_auto) and (not args.distributed_ep) and (table_dev is not None):
+        raise ValueError("DDP training cannot combine --engram-table-device cpu with multi-rank torchrun")
     use_ddp = distributed and (not args.device_map_auto) and (not args.distributed_ep) and (table_dev is None)
     model_run: torch.nn.Module = DDP(qec, device_ids=[local_rank]) if use_ddp else qec
     param_groups = qec.parameter_groups()
@@ -539,6 +654,16 @@ def main() -> None:
             qec.inter_scales.load_state_dict(ckpt["inter_scales"])
         if "expert_bias" in ckpt:
             qec.expert_bias.load_state_dict(ckpt["expert_bias"])
+        if "norms" in ckpt:
+            named_p = dict(qec.model.named_parameters())
+            with torch.no_grad():
+                for k, v in ckpt["norms"].items():
+                    if k in named_p:
+                        named_p[k].data.copy_(v.to(device=named_p[k].device, dtype=named_p[k].dtype))
+        if short_shards is not None and "short_shard_state" in ckpt:
+            short_shards.load_state_dict(ckpt["short_shard_state"])
+        if long_shards is not None and "long_shard_state" in ckpt:
+            long_shards.load_state_dict(ckpt["long_shard_state"])
         opt.load_state_dict(ckpt["optimizer"])
         sched.load_state_dict(ckpt["scheduler"])
         start_step = int(ckpt["step"])
@@ -553,7 +678,7 @@ def main() -> None:
     out_dir = Path(args.output)
     eval_dir = Path(args.eval_dense_dir) if args.eval_dense_dir else None
     if eval_dir is not None and start_step == 0:
-        base_eval = evaluate_dense_dir(qec, eval_dir, is_writer=is_writer)
+        base_eval = evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
         if is_writer:
             eval_history.append({"tokens_m": 0.0, "step": 0, "eval": base_eval})
             print(f"[eval @ 0.0M] {json.dumps(base_eval)}", flush=True)
@@ -565,23 +690,35 @@ def main() -> None:
         if not is_writer:
             return
         out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "step": cur_step,
-                "banks": qec.banks.state_dict(),
-                "engrams": qec.engrams.state_dict(),
-                "loras": qec.loras.state_dict(),
-                "inter_scales": qec.inter_scales.state_dict(),
-                "expert_bias": qec.expert_bias.state_dict(),
-                "optimizer": opt.state_dict(),
-                "scheduler": sched.state_dict(),
-                "short_cursor": short_cursor,
-                "long_cursor": long_cursor,
-                "short_tokens_seen": short_tokens_seen,
-                "long_tokens_seen": long_tokens_seen,
-            },
-            out_dir / f"checkpoint_{tag}.pt",
-        )
+        norm_keys = set(qec._promoted_norm_keys)
+        norms_state = {
+            k: v.detach().cpu()
+            for k, v in qec.model.named_parameters()
+            if k in norm_keys
+        }
+        payload: dict[str, Any] = {
+            "step": cur_step,
+            "banks": qec.banks.state_dict(),
+            "engrams": qec.engrams.state_dict(),
+            "loras": qec.loras.state_dict(),
+            "inter_scales": qec.inter_scales.state_dict(),
+            "expert_bias": qec.expert_bias.state_dict(),
+            "norms": norms_state,
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "short_cursor": short_cursor,
+            "long_cursor": long_cursor,
+            "short_tokens_seen": short_tokens_seen,
+            "long_tokens_seen": long_tokens_seen,
+        }
+        if short_shards is not None:
+            payload["short_shard_state"] = short_shards.state_dict()
+        if long_shards is not None:
+            payload["long_shard_state"] = long_shards.state_dict()
+        ckpt_path = out_dir / f"checkpoint_{tag}.pt"
+        tmp_path = ckpt_path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, ckpt_path)
 
     for step in range(start_step, total_steps):
         phase = schedule[step]
@@ -663,11 +800,15 @@ def main() -> None:
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
             _save_checkpoint("resumable", step + 1)
 
-        if next_milestone_idx < len(milestones_m) and seen_m >= milestones_m[next_milestone_idx]:
+        hit_milestone = (
+            next_milestone_idx < len(milestones_m)
+            and (seen_m >= milestones_m[next_milestone_idx] or (step + 1 == total_steps))
+        )
+        if hit_milestone:
             m_tag = f"{milestones_m[next_milestone_idx]:.0f}m"
             _save_checkpoint(m_tag, step + 1)
             if eval_dir is not None:
-                m_eval = evaluate_dense_dir(qec, eval_dir, is_writer=is_writer)
+                m_eval = evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
                 if is_writer:
                     eval_history.append({"tokens_m": round(seen_m, 3), "step": step + 1, "eval": m_eval})
                     print(f"[eval @ {seen_m:.2f}M] {json.dumps(m_eval)}", flush=True)
@@ -676,9 +817,33 @@ def main() -> None:
     if distributed:
         dist.barrier()
 
-    pre_merge_eval = evaluate_dense_dir(qec, eval_dir, is_writer=is_writer) if eval_dir is not None else None
+    pre_merge_eval = (
+        evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+        if eval_dir is not None
+        else None
+    )
     merged = qec.merge_lora_into_model()
-    post_merge_eval = evaluate_dense_dir(qec, eval_dir, is_writer=is_writer) if eval_dir is not None else None
+    post_merge_eval = (
+        evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+        if eval_dir is not None
+        else None
+    )
+    post_merge_bf16_engram_eval = None
+    post_merge_fp8_engram_eval = None
+    if eval_dir is not None:
+        bf16_bak = qec.quantize_engram_tables_inplace(torch.bfloat16)
+        post_merge_bf16_engram_eval = evaluate_dense_dir(
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+        )
+        qec.restore_engram_tables(bf16_bak)
+        fp8_bak = qec.quantize_engram_tables_inplace(torch.float8_e4m3fn)
+        post_merge_fp8_engram_eval = evaluate_dense_dir(
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+        )
+        qec.restore_engram_tables(fp8_bak)
+        if is_writer:
+            print(f"[eval post-merge BF16 engram] {json.dumps(post_merge_bf16_engram_eval)}", flush=True)
+            print(f"[eval post-merge FP8 engram]  {json.dumps(post_merge_fp8_engram_eval)}", flush=True)
 
     if is_writer:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -711,6 +876,8 @@ def main() -> None:
             "use_router_gate": args.use_router_gate,
             "pre_merge_eval": pre_merge_eval,
             "post_merge_eval": post_merge_eval,
+            "post_merge_bf16_engram_eval": post_merge_bf16_engram_eval,
+            "post_merge_fp8_engram_eval": post_merge_fp8_engram_eval,
             "eval_history": eval_history,
         }
         (out_dir / "qec_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

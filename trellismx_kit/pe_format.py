@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -31,6 +32,7 @@ from .trellis_ref import (
     TILE_I16,
     TILE_U32,
     decode_tile_operands,
+    decode_tile_values,
 )
 
 SIDECAR_SCHEMA = "trellismx-p8-coupled-per-expert-rank.v2"
@@ -279,7 +281,9 @@ def write_rank_sidecar(
 
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(out_path), metadata=metadata)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".partial")
+    save_file(tensors, str(tmp_path), metadata=metadata)
+    os.replace(tmp_path, out_path)
     return out_path
 
 
@@ -471,6 +475,223 @@ def decode_expert_operands_from_layout(
         decode_tile_operands(u_tiles, rate),
         decode_tile_operands(d_tiles, rate),
     )
+
+
+def tensor_core_permutation(device: torch.device | str = "cpu") -> torch.Tensor:
+    """MMA B-fragment tile permutation matching native 16x16 trellis packing."""
+    perm = [0] * 256
+    for thread in range(32):
+        row0 = (thread % 4) * 2
+        row1 = row0 + 1
+        row2 = row0 + 8
+        row3 = row0 + 9
+        col0 = thread // 4
+        col1 = col0 + 8
+        perm[thread * 8 + 0] = row0 * 16 + col0
+        perm[thread * 8 + 1] = row1 * 16 + col0
+        perm[thread * 8 + 2] = row2 * 16 + col0
+        perm[thread * 8 + 3] = row3 * 16 + col0
+        perm[thread * 8 + 4] = row0 * 16 + col1
+        perm[thread * 8 + 5] = row1 * 16 + col1
+        perm[thread * 8 + 6] = row2 * 16 + col1
+        perm[thread * 8 + 7] = row3 * 16 + col1
+    return torch.tensor(perm, dtype=torch.long, device=device)
+
+
+def _block_hadamard(values: torch.Tensor, *, block_size: int, dim: int = -1) -> torch.Tensor:
+    axis = dim % values.ndim
+    output = values.float().movedim(axis, -1).contiguous().clone()
+    shape = output.shape
+    output = output.reshape(*shape[:-1], shape[-1] // block_size, block_size)
+    width = 1
+    while width < block_size:
+        paired = output.reshape(*output.shape[:-1], -1, 2, width)
+        left = paired[..., 0, :].clone()
+        right = paired[..., 1, :].clone()
+        paired[..., 0, :] = left + right
+        paired[..., 1, :] = left - right
+        output = paired.reshape(*output.shape)
+        width *= 2
+    return (
+        output.div_(math.sqrt(block_size))
+        .reshape(shape)
+        .movedim(-1, axis)
+        .contiguous()
+    )
+
+
+def _rotation_signs(length: int, *, draw: int, axis: int, device: torch.device) -> torch.Tensor:
+    if draw == 0:
+        return torch.ones(length, dtype=torch.float32, device=device)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed((0x6A09E667F3BCC909 * draw + 0xBB67AE8584CAA73B * axis) & ((1 << 63) - 1))
+    return torch.randint(0, 2, (length,), generator=gen).mul_(2).sub_(1).float().to(device)
+
+
+def _atom_interleave(slot0: torch.Tensor, slot1: torch.Tensor) -> torch.Tensor:
+    atoms = slot0.shape[-1] // 32
+    prefix = slot0.shape[:-1]
+    return torch.stack(
+        (slot0.reshape(*prefix, atoms, 32), slot1.reshape(*prefix, atoms, 32)),
+        dim=-2,
+    ).reshape(*prefix, 2 * slot0.shape[-1])
+
+
+def _atom_interleave_rows(slot0: torch.Tensor, slot1: torch.Tensor) -> torch.Tensor:
+    atoms = slot0.shape[0] // 32
+    width = slot0.shape[1]
+    return torch.stack(
+        (slot0.reshape(atoms, 32, width), slot1.reshape(atoms, 32, width)),
+        dim=1,
+    ).reshape(2 * slot0.shape[0], width)
+
+
+def decode_coupled_scale_weights(
+    slot0: torch.Tensor,
+    slot1: torch.Tensor,
+    down_core: torch.Tensor,
+    *,
+    gate_up_suh: torch.Tensor,
+    gate_svh: torch.Tensor,
+    up_svh: torch.Tensor,
+    down_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+    intermediate_draw: int = 0,
+    hadamard_input: int = 128,
+    hadamard_residual: int = 512,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Invert the coupled H512/H128 scale sandwich back to logical (gate, up, down)."""
+    device = slot0.device
+    intermediate, hidden = slot0.shape
+    suh = gate_up_suh.to(device=device, dtype=torch.float32)
+    g_svh = gate_svh.to(device=device, dtype=torch.float32)
+    u_svh = up_svh.to(device=device, dtype=torch.float32)
+    d_suh = down_suh.to(device=device, dtype=torch.float32)
+    d_svh = down_svh.to(device=device, dtype=torch.float32)
+    pre_signs = _rotation_signs(2 * intermediate, draw=intermediate_draw, axis=1, device=device)
+    post_signs = _rotation_signs(intermediate, draw=intermediate_draw, axis=2, device=device)
+
+    s0 = _block_hadamard(slot0.float(), block_size=hadamard_input, dim=1) * suh[None]
+    s0 = _block_hadamard(s0, block_size=hadamard_residual, dim=1)
+    s1 = _block_hadamard(slot1.float(), block_size=hadamard_input, dim=1) * suh[None]
+    s1 = _block_hadamard(s1, block_size=hadamard_residual, dim=1)
+
+    raw_rows = _atom_interleave_rows(s0, s1)
+    pair_scales = _atom_interleave(g_svh[None], u_svh[None])[0]
+    logical = _block_hadamard(raw_rows, block_size=hadamard_input, dim=0) * pair_scales[:, None]
+    logical = _block_hadamard(logical, block_size=hadamard_input, dim=0) * pre_signs[:, None]
+    gate = logical[0::2].contiguous()
+    up = logical[1::2].contiguous()
+
+    d = _block_hadamard(down_core.float(), block_size=hadamard_input, dim=1) * d_suh[None]
+    d = _block_hadamard(d, block_size=hadamard_input, dim=1) * post_signs[None]
+    d = _block_hadamard(d, block_size=hadamard_input, dim=0) * d_svh[:, None]
+    down = _block_hadamard(d, block_size=hadamard_residual, dim=0).contiguous()
+    return gate, up, down
+
+
+def _ue8m0_to_float(codes: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, codes.to(torch.float32) - 127.0)
+
+
+def _decode_trellis_matrix(
+    packed_tiles: torch.Tensor,
+    scale_ue8m0: torch.Tensor,
+    rate: str,
+    *,
+    rows: int,
+    width: int,
+    inv_perm: torch.Tensor,
+) -> torch.Tensor:
+    """Decode [width//16, rows//16, tile_i16] int16 tiles + [rows, width//32] UE8M0 into [rows, width] FP32."""
+    in_tiles = width // 16
+    out_tiles = rows // 16
+    flat = packed_tiles.reshape(-1, TILE_I16[rate])
+    vals = decode_tile_values(flat, rate)
+    logical = vals.index_select(1, inv_perm).reshape(in_tiles, out_tiles, 16, 16)
+    mat = logical.permute(1, 3, 0, 2).contiguous().reshape(rows, width)
+    scales = _ue8m0_to_float(scale_ue8m0).repeat_interleave(32, dim=1)
+    return mat * scales
+
+
+def decode_release_layer_experts(
+    sidecars_by_rank: Sequence[Sidecar],
+    profile: ModelProfile,
+    expert_indices: Sequence[int],
+    *,
+    device: torch.device | str = "cpu",
+    invert_coupled_scales: bool = True,
+) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    """Decode physical logical (gate_up [2*I, H], down [H, I]) tensors from 4-rate TP rank sidecars."""
+    dev = torch.device(device)
+    tp_size = profile.tp_size
+    if len(sidecars_by_rank) != tp_size:
+        raise ValueError(f"expected {tp_size} rank sidecars, got {len(sidecars_by_rank)}")
+    local_i = profile.local_intermediate_size
+    hidden = profile.hidden_size
+    inv_perm = torch.argsort(tensor_core_permutation(dev))
+
+    has_coupled = all(
+        k in sidecars_by_rank[0].tensors
+        for k in ("gate_up_suh_fp16", "down_svh_fp16", "intermediate_scales_fp16")
+    )
+    gate_up_suh = sidecars_by_rank[0].tensors["gate_up_suh_fp16"].to(dev) if has_coupled else None
+    down_svh = sidecars_by_rank[0].tensors["down_svh_fp16"].to(dev) if has_coupled else None
+
+    decoded: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for expert in expert_indices:
+        e = int(expert)
+        slot0_parts, slot1_parts, down_parts = [], [], []
+        g_svh_parts, u_svh_parts, d_suh_parts = [], [], []
+        draw = 0
+        for sc in sidecars_by_rank:
+            rate = RATE_NAME[int(sc.rates[e].item())]
+            slot = int(sc.slots[e].item())
+            w13_bank = sc.tensors[f"w13_trellis_{rate}"]
+            w2_bank = sc.tensors[f"w2_trellis_{rate}"]
+            s13 = sc.tensors["w13_scale_ue8m0"][e].to(dev)
+            s2 = sc.tensors["w2_scale_ue8m0"][e].to(dev)
+            # w13_trellis dim 0 is [gate, up]; w13_scale_ue8m0 dim 0 is [up, gate]
+            g_slice = _decode_trellis_matrix(
+                w13_bank[0, slot].to(dev), s13[local_i:], rate, rows=local_i, width=hidden, inv_perm=inv_perm
+            )
+            u_slice = _decode_trellis_matrix(
+                w13_bank[1, slot].to(dev), s13[:local_i], rate, rows=local_i, width=hidden, inv_perm=inv_perm
+            )
+            d_slice = _decode_trellis_matrix(
+                w2_bank[slot].to(dev), s2, rate, rows=hidden, width=local_i, inv_perm=inv_perm
+            )
+            slot0_parts.append(g_slice)
+            slot1_parts.append(u_slice)
+            down_parts.append(d_slice)
+            if has_coupled:
+                inter = sc.tensors["intermediate_scales_fp16"][e].to(dev)
+                g_svh_parts.append(inter[:local_i])
+                u_svh_parts.append(inter[local_i : 2 * local_i])
+                d_suh_parts.append(inter[2 * local_i : 3 * local_i])
+                if "coupled_sign_draw_u8" in sc.tensors:
+                    draw = int(sc.tensors["coupled_sign_draw_u8"][e].item())
+
+        slot0 = torch.cat(slot0_parts, dim=0)
+        slot1 = torch.cat(slot1_parts, dim=0)
+        down_core = torch.cat(down_parts, dim=1)
+        if invert_coupled_scales and has_coupled and gate_up_suh is not None and down_svh is not None:
+            gate, up, down = decode_coupled_scale_weights(
+                slot0,
+                slot1,
+                down_core,
+                gate_up_suh=gate_up_suh,
+                gate_svh=torch.cat(g_svh_parts, dim=0),
+                up_svh=torch.cat(u_svh_parts, dim=0),
+                down_suh=torch.cat(d_suh_parts, dim=0),
+                down_svh=down_svh,
+                intermediate_draw=draw,
+            )
+        else:
+            gate, up, down = slot0, slot1, down_core
+        gate_up = torch.cat((gate, up), dim=0).contiguous()
+        decoded[e] = (gate_up, down.contiguous())
+    return decoded
 
 
 def synthetic_rank_sidecar(

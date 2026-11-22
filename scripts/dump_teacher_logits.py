@@ -35,9 +35,15 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="One or more int32 [N, seq_len] .pt files for dense eval logits (e.g. 8K and 32K/64K splits)",
     )
-    parser.add_argument("--eval-dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--eval-dtype", choices=("bfloat16", "float32"), default="float32")
+    parser.add_argument("--vocab-limit", type=int, default=0, help="Optional vocabulary slice limit (e.g. 154880)")
     parser.add_argument("--short-tokens", default="", help="Optional int32 [N, seq_len] .pt file for 80% short distillation split")
-    parser.add_argument("--long-tokens", default="", help="Optional int32 [N, seq_len] .pt file for 20% long distillation split")
+    parser.add_argument(
+        "--long-tokens",
+        nargs="*",
+        default=[],
+        help="One or more int32 [N, seq_len] .pt files for 20% long distillation splits (e.g. 16K, 32K, 64K)",
+    )
     parser.add_argument("--topk", type=int, default=128, help="Top-K logits saved per position (64 -> 396 B/tok, 128 -> 780 B/tok)")
     parser.add_argument("--short-batch-size", type=int, default=8)
     parser.add_argument("--long-batch-size", type=int, default=1)
@@ -122,6 +128,7 @@ def dump_dense_eval(
     split_name: str,
     dtype: torch.dtype,
     *,
+    vocab_limit: int = 0,
     is_writer: bool = True,
     resume: bool = False,
 ) -> dict[str, object]:
@@ -137,14 +144,18 @@ def dump_dense_eval(
             continue
         ids = tokens[idx : idx + 1].to(device=dev, dtype=torch.long)
         logits = model(input_ids=ids, use_cache=False).logits[0, :-1]
+        if vocab_limit > 0:
+            logits = logits[:, :vocab_limit]
         if is_writer:
+            tmp_path = out_path.with_suffix(".pt.tmp")
             torch.save(
                 {
                     "token_ids": tokens[idx].to(torch.int32).contiguous(),
                     "logits": logits.to(dtype=dtype).cpu().contiguous(),
                 },
-                out_path,
+                tmp_path,
             )
+            os.replace(tmp_path, out_path)
         total_positions += pos
     return {
         "split": split_name,
@@ -250,6 +261,9 @@ def dump_sparse_split(
 
 def main() -> None:
     args = parse_args()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     out_root = Path(args.output)
 
     distributed = args.distributed_ep and ("RANK" in os.environ)
@@ -293,6 +307,7 @@ def main() -> None:
                     out_root / "eval_dense",
                     p.stem,
                     eval_dtype,
+                    vocab_limit=args.vocab_limit,
                     is_writer=is_writer,
                     resume=args.resume,
                 )
@@ -314,20 +329,25 @@ def main() -> None:
             resume=args.resume,
         )
     if args.long_tokens:
-        long_toks = torch.load(args.long_tokens, map_location="cpu", weights_only=True)
-        manifest["train_long"] = dump_sparse_split(
-            model,
-            long_toks,
-            out_root / "train_long",
-            topk=args.topk,
-            batch_size=args.long_batch_size,
-            rows_per_shard=args.long_rows_per_shard,
-            logit_chunk_tokens=args.logit_chunk_tokens,
-            is_writer=is_writer,
-            shard_rank=args.shard_rank,
-            shard_world=args.shard_world,
-            resume=args.resume,
-        )
+        long_paths = [Path(s) for s in args.long_tokens if s]
+        long_summaries = {}
+        for p in long_paths:
+            long_toks = torch.load(p, map_location="cpu", weights_only=True)
+            out_sub = out_root / ("train_long" if len(long_paths) == 1 else p.stem)
+            long_summaries[p.stem] = dump_sparse_split(
+                model,
+                long_toks,
+                out_sub,
+                topk=args.topk,
+                batch_size=args.long_batch_size,
+                rows_per_shard=args.long_rows_per_shard,
+                logit_chunk_tokens=args.logit_chunk_tokens,
+                is_writer=is_writer,
+                shard_rank=args.shard_rank,
+                shard_world=args.shard_world,
+                resume=args.resume,
+            )
+        manifest["train_long"] = long_summaries
 
     if distributed:
         dist.barrier()

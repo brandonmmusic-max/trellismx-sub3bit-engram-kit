@@ -31,6 +31,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from .profile import ModelProfile
 
@@ -879,6 +880,11 @@ class FullStackQEC(nn.Module):
                     table_device=table_dev,
                     seed=7000 + idx_b * 100,
                 )
+                if table_dev is None and layers_in_bank:
+                    first_block = _resolve_attr(
+                        model, profile.layer_path_template.format(layer=layers_in_bank[0])
+                    )
+                    bank = bank.to(_module_device(first_block))
                 self.banks[bname] = bank
                 for l_idx in layers_in_bank:
                     self.bank_map[int(l_idx)] = bname
@@ -1023,15 +1029,27 @@ class FullStackQEC(nn.Module):
             orig_fwd = norm_mod.forward
 
             def _fp32_norm_forward(*args, **kwargs):
-                if not args:
+                orig_dtype = None
+                for a in args:
+                    if isinstance(a, torch.Tensor) and a.is_floating_point():
+                        orig_dtype = a.dtype
+                        break
+                if orig_dtype is None:
+                    for v in kwargs.values():
+                        if isinstance(v, torch.Tensor) and v.is_floating_point():
+                            orig_dtype = v.dtype
+                            break
+                if orig_dtype is None:
                     return orig_fwd(*args, **kwargs)
-                hidden_states = args[0]
-                orig_dtype = hidden_states.dtype
-                new_args = (hidden_states.float(),) + tuple(
+                new_args = tuple(
                     a.float() if isinstance(a, torch.Tensor) and a.is_floating_point() else a
-                    for a in args[1:]
+                    for a in args
                 )
-                return orig_fwd(*new_args, **kwargs).to(orig_dtype)
+                new_kwargs = {
+                    k: (v.float() if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+                    for k, v in kwargs.items()
+                }
+                return orig_fwd(*new_args, **new_kwargs).to(orig_dtype)
 
             norm_mod.forward = _fp32_norm_forward  # type: ignore[method-assign]
         norm_mod.weight.requires_grad_(True)
@@ -1079,11 +1097,19 @@ class FullStackQEC(nn.Module):
                         )
                     if self.engram_mode == "v2_shared_banks":
                         bname = self.bank_map[layer_idx]
-                        bank_out = self._bank_cache.get(bname)
-                        if bank_out is None:
+                        use_live_lookup = (
+                            torch.is_grad_enabled()
+                            and self.training
+                            and bool(getattr(self.model, "is_gradient_checkpointing", False))
+                        )
+                        if use_live_lookup:
                             bank_out = self.banks[bname].lookup(self.cur_tokens, out_device=h.device)
-                            self._bank_cache[bname] = bank_out
-                        rw = self._route_cache.pop(layer_idx, None)
+                        else:
+                            bank_out = self._bank_cache.get(bname)
+                            if bank_out is None:
+                                bank_out = self.banks[bname].lookup(self.cur_tokens, out_device=h.device)
+                                self._bank_cache[bname] = bank_out
+                        rw = self._route_cache.get(layer_idx)
                         delta = m(h, bank_out, rw)
                     else:
                         delta = m(h, self.cur_tokens)
@@ -1116,6 +1142,8 @@ class FullStackQEC(nn.Module):
         self._orig_moe_forwards[layer_idx] = (moe, orig_moe_fwd)
 
         swiglu_limit = getattr(experts, "swiglu_limit", None)
+        if swiglu_limit is None and self.profile.activation == "silu-cap10":
+            swiglu_limit = 10.0
         num_total_experts = self.profile.num_experts
 
         def experts_qec_fwd(
@@ -1169,12 +1197,9 @@ class FullStackQEC(nn.Module):
             experts.forward = experts_qec_fwd  # type: ignore[method-assign]
 
         if save_route:
-            def moe_route_fwd(hidden_states: torch.Tensor) -> torch.Tensor:
-                residuals = hidden_states
-                orig_shape = hidden_states.shape
-                _, topk_weights, topk_indices = moe.gate(hidden_states)
+            def _record_route(hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor) -> None:
                 with torch.no_grad():
-                    bsz, seq_len = orig_shape[0], orig_shape[1]
+                    bsz, seq_len = int(hidden_states.shape[0]), int(hidden_states.shape[1])
                     rw = torch.zeros(
                         (bsz * seq_len, num_total_experts),
                         device=hidden_states.device,
@@ -1182,17 +1207,30 @@ class FullStackQEC(nn.Module):
                     )
                     rw.scatter_add_(
                         1,
-                        topk_indices.reshape(-1, topk_indices.shape[-1]).clamp(0, num_total_experts - 1),
+                        topk_indices.reshape(-1, topk_indices.shape[-1]).to(torch.long).clamp(0, num_total_experts - 1),
                         topk_weights.reshape(-1, topk_weights.shape[-1]).float(),
                     )
-                    self._route_cache[layer_idx] = rw.view(bsz, seq_len, num_total_experts)
-                flat = hidden_states.view(-1, hidden_states.shape[-1])
-                out = moe.experts(flat, topk_indices, topk_weights).view(*orig_shape)
-                if hasattr(moe, "shared_experts") and moe.shared_experts is not None:
-                    out = out + moe.shared_experts(residuals)
-                return out
+                    self._route_cache[layer_idx] = rw.reshape(bsz, seq_len, num_total_experts)
 
-            moe.forward = moe_route_fwd  # type: ignore[method-assign]
+            if isinstance(moe.gate, nn.Module):
+                def _gate_hook(_module, inp, out):
+                    if isinstance(out, tuple) and len(out) >= 3:
+                        _record_route(inp[0], out[1], out[2])
+
+                self._engram_handles.append(moe.gate.register_forward_hook(_gate_hook))
+            else:
+                def moe_route_fwd(hidden_states: torch.Tensor) -> torch.Tensor:
+                    residuals = hidden_states
+                    orig_shape = hidden_states.shape
+                    _, topk_weights, topk_indices = moe.gate(hidden_states)
+                    _record_route(hidden_states, topk_weights, topk_indices)
+                    flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                    out = moe.experts(flat, topk_indices, topk_weights).reshape(*orig_shape)
+                    if hasattr(moe, "shared_experts") and moe.shared_experts is not None:
+                        out = out + moe.shared_experts(residuals)
+                    return out
+
+                moe.forward = moe_route_fwd  # type: ignore[method-assign]
 
     def _wrap_granite_moe(self, layer_idx: int, moe: nn.Module, *, save_route: bool) -> None:
         """Wrap Granite-style ``block_sparse_moe`` (``router`` + ``input_linear`` + ``output_linear``)."""
@@ -1237,10 +1275,49 @@ class FullStackQEC(nn.Module):
         moe.forward = fwd  # type: ignore[method-assign]
 
     def train(self, mode: bool = True) -> "FullStackQEC":
-        """Toggle training mode on QEC modules while keeping the frozen student in eval mode."""
+        """Toggle training mode on QEC modules while preserving gradient checkpointing on frozen student."""
         super().train(mode)
-        self.model.eval()
+        if mode and bool(getattr(self.model, "is_gradient_checkpointing", False)):
+            self.model.train(True)
+            for mod in self.model.modules():
+                if isinstance(mod, nn.Dropout):
+                    mod.eval()
+        else:
+            self.model.eval()
         return self
+
+    @torch.no_grad()
+    def quantize_engram_tables_inplace(self, table_dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        """Quantize Engram bank/v1 embedding tables in-place (BF16 or FP8 E4M3 dequantized) and return backups."""
+        backups: dict[str, torch.Tensor] = {}
+
+        def _qdq(w: torch.Tensor) -> torch.Tensor:
+            if table_dtype == torch.float8_e4m3fn:
+                q, sc = _quantize_fp8_per_row(w)
+                return (q.to(device=w.device, dtype=torch.float32) * sc.to(device=w.device).unsqueeze(-1)).to(w.dtype)
+            return w.detach().to(table_dtype).to(w.dtype)
+
+        for bname, bank in self.banks.items():
+            for name, param in bank.named_parameters():
+                if name.endswith(".weight") and param.ndim == 2:
+                    key = f"banks.{bname}.{name}"
+                    backups[key] = param.data.detach().cpu().clone()
+                    param.data.copy_(_qdq(param.data))
+        for lkey, mod in self.engrams.items():
+            for name, param in mod.named_parameters():
+                if ("emb" in name) and name.endswith(".weight") and param.ndim == 2:
+                    key = f"engrams.{lkey}.{name}"
+                    backups[key] = param.data.detach().cpu().clone()
+                    param.data.copy_(_qdq(param.data))
+        return backups
+
+    @torch.no_grad()
+    def restore_engram_tables(self, backups: Mapping[str, torch.Tensor]) -> None:
+        """Restore Engram embedding tables from a backup dict returned by quantize_engram_tables_inplace."""
+        named = dict(self.named_parameters())
+        for key, saved in backups.items():
+            if key in named:
+                named[key].data.copy_(saved.to(device=named[key].device, dtype=named[key].dtype))
 
     def forward(self, input_ids: torch.Tensor, **kwargs):
         """Standard forward entrypoint compatible with DistributedDataParallel and pipeline sharding."""
@@ -1425,6 +1502,66 @@ def build_context_curriculum(
     return schedule
 
 
+def _topk_kl_chunk(
+    s_chunk: torch.Tensor,
+    idx_chunk: torch.Tensor,
+    t_logp_chunk: torch.Tensor,
+    t_lse_chunk: torch.Tensor | None,
+    t_logits_chunk: torch.Tensor | None,
+    t_ptail_chunk: torch.Tensor | None,
+) -> torch.Tensor:
+    idx_dev = idx_chunk.to(device=s_chunk.device, dtype=torch.long)
+    s_logp = F.log_softmax(s_chunk.float(), dim=-1)
+    s_top_logp = s_logp.gather(-1, idx_dev)
+
+    use_tail = (
+        t_ptail_chunk is not None
+        or t_lse_chunk is not None
+        or t_logits_chunk is not None
+    )
+    if use_tail:
+        if t_logits_chunk is not None:
+            if t_lse_chunk is None:
+                raise ValueError("teacher_top_logits requires teacher_logsumexp")
+            t_top_logp = (
+                t_logits_chunk.to(device=s_chunk.device, dtype=torch.float32)
+                - t_lse_chunk.to(device=s_chunk.device, dtype=torch.float32).unsqueeze(-1)
+            )
+        else:
+            t_top_logp = t_logp_chunk.to(device=s_chunk.device, dtype=torch.float32)
+
+        t_top_logp = t_top_logp.clamp_max(0.0)
+        t_top_p = t_top_logp.exp()
+        if t_ptail_chunk is not None:
+            p_tail = t_ptail_chunk.to(device=s_chunk.device, dtype=torch.float32).clamp(0.0, 1.0)
+        else:
+            p_tail = (1.0 - t_top_p.sum(dim=-1)).clamp_min(0.0)
+
+        mass = t_top_p.sum(dim=-1) + p_tail
+        if bool((mass > 1.0).any()):
+            scale = mass.clamp_min(1.0)
+            t_top_p = t_top_p / scale.unsqueeze(-1)
+            t_top_logp = t_top_p.clamp_min(1e-30).log()
+            p_tail = p_tail / scale
+
+        s_masked = s_logp.scatter(-1, idx_dev, float("-inf"))
+        log_q_tail = torch.logsumexp(s_masked, dim=-1)
+        has_tail = (p_tail > 1e-12) & torch.isfinite(log_q_tail)
+        safe_log_q_tail = torch.where(has_tail, log_q_tail, torch.zeros_like(log_q_tail))
+
+        kl_top = (t_top_p * (t_top_logp - s_top_logp)).sum(dim=-1)
+        kl_tail = torch.where(
+            has_tail,
+            p_tail * (p_tail.clamp_min(1e-12).log() - safe_log_q_tail),
+            torch.zeros_like(p_tail),
+        )
+        return (kl_top + kl_tail).sum()
+
+    t_renorm = F.log_softmax(t_logp_chunk.to(device=s_chunk.device, dtype=torch.float32), dim=-1)
+    t_p = t_renorm.exp()
+    return (t_p * (t_renorm - s_top_logp)).sum(dim=-1).sum()
+
+
 def topk_kl_loss(
     student_logits: torch.Tensor,
     teacher_top_logp: torch.Tensor,
@@ -1435,64 +1572,32 @@ def topk_kl_loss(
     teacher_p_tail: torch.Tensor | None = None,
     chunk_tokens: int = 512,
 ) -> torch.Tensor:
-    """Chunked, log-space exact tail-calibrated KL(teacher || student) over [B, T, K]."""
+    """Chunked, checkpointed log-space exact tail-calibrated KL(teacher || student) over [B, T, K]."""
     bsz, seq_len, _vocab = student_logits.shape
     total_loss = student_logits.new_zeros((), dtype=torch.float32)
+    use_ckpt = bool(student_logits.requires_grad and seq_len > chunk_tokens)
 
     for t0 in range(0, seq_len, chunk_tokens):
         t1 = min(seq_len, t0 + chunk_tokens)
         s_chunk = student_logits[:, t0:t1]
-        idx_chunk = teacher_top_idx[:, t0:t1].to(device=s_chunk.device, dtype=torch.long)
-        s_logp = F.log_softmax(s_chunk.float(), dim=-1)
-        s_top_logp = s_logp.gather(-1, idx_chunk)
-
-        use_tail = (
-            teacher_p_tail is not None
-            or teacher_logsumexp is not None
-            or teacher_top_logits is not None
-        )
-        if use_tail:
-            if teacher_top_logits is not None:
-                if teacher_logsumexp is None:
-                    raise ValueError("teacher_top_logits requires teacher_logsumexp")
-                t_top_logp = (
-                    teacher_top_logits[:, t0:t1].to(device=s_chunk.device, dtype=torch.float32)
-                    - teacher_logsumexp[:, t0:t1].to(device=s_chunk.device, dtype=torch.float32).unsqueeze(-1)
-                )
-            else:
-                t_top_logp = teacher_top_logp[:, t0:t1].to(device=s_chunk.device, dtype=torch.float32)
-
-            t_top_logp = t_top_logp.clamp_max(0.0)
-            t_top_p = t_top_logp.exp()
-            if teacher_p_tail is not None:
-                p_tail = teacher_p_tail[:, t0:t1].to(device=s_chunk.device, dtype=torch.float32).clamp(0.0, 1.0)
-            else:
-                p_tail = (1.0 - t_top_p.sum(dim=-1)).clamp_min(0.0)
-
-            mass = t_top_p.sum(dim=-1) + p_tail
-            if bool((mass > 1.0).any()):
-                scale = mass.clamp_min(1.0)
-                t_top_p = t_top_p / scale.unsqueeze(-1)
-                t_top_logp = t_top_p.clamp_min(1e-30).log()
-                p_tail = p_tail / scale
-
-            s_masked = s_logp.scatter(-1, idx_chunk, float("-inf"))
-            log_q_tail = torch.logsumexp(s_masked, dim=-1)
-            has_tail = (p_tail > 1e-12) & torch.isfinite(log_q_tail)
-            safe_log_q_tail = torch.where(has_tail, log_q_tail, torch.zeros_like(log_q_tail))
-
-            kl_top = (t_top_p * (t_top_logp - s_top_logp)).sum(dim=-1)
-            kl_tail = torch.where(
-                has_tail,
-                p_tail * (p_tail.clamp_min(1e-12).log() - safe_log_q_tail),
-                torch.zeros_like(p_tail),
+        idx_chunk = teacher_top_idx[:, t0:t1]
+        lp_chunk = teacher_top_logp[:, t0:t1]
+        lse_chunk = teacher_logsumexp[:, t0:t1] if teacher_logsumexp is not None else None
+        tlog_chunk = teacher_top_logits[:, t0:t1] if teacher_top_logits is not None else None
+        pt_chunk = teacher_p_tail[:, t0:t1] if teacher_p_tail is not None else None
+        if use_ckpt:
+            chunk_loss = _grad_checkpoint(
+                _topk_kl_chunk,
+                s_chunk,
+                idx_chunk,
+                lp_chunk,
+                lse_chunk,
+                tlog_chunk,
+                pt_chunk,
+                use_reentrant=False,
             )
-            total_loss = total_loss + (kl_top + kl_tail).sum()
         else:
-            t_renorm = F.log_softmax(
-                teacher_top_logp[:, t0:t1].to(device=s_chunk.device, dtype=torch.float32), dim=-1
-            )
-            t_p = t_renorm.exp()
-            total_loss = total_loss + (t_p * (t_renorm - s_top_logp)).sum(dim=-1).sum()
+            chunk_loss = _topk_kl_chunk(s_chunk, idx_chunk, lp_chunk, lse_chunk, tlog_chunk, pt_chunk)
+        total_loss = total_loss + chunk_loss
 
     return total_loss / float(max(1, bsz * seq_len))

@@ -653,3 +653,159 @@ def test_dual_trellis_v2_shared_banks_mhc_inter_scales_bias_lm_head_and_fp8_expo
     assert eqec["layer_0.intermediate_scales_fp16"].dtype == torch.float16
     assert eqec["layer_0.expert_bias_bf16"].dtype == torch.bfloat16
     qec.remove_hooks()
+
+
+def test_coupled_scale_inverse_exact_and_grad_checkpointing_and_bca_kld() -> None:
+    from trellismx_kit.kld_score import tokenwise_kld_and_alignment_fp64
+    from trellismx_kit.pe_format import (
+        _atom_interleave,
+        _block_hadamard,
+        _rotation_signs,
+        decode_coupled_scale_weights,
+    )
+
+    # 1. Exact algebraic inverse of coupled H512/H128 scale sandwich
+    torch.manual_seed(11)
+    hidden, inter = 512, 256
+    gate = torch.randn(inter, hidden) * 0.1
+    up = torch.randn(inter, hidden) * 0.1
+    down = torch.randn(hidden, inter) * 0.1
+    suh = (torch.randint(0, 2, (hidden,)) * 2 - 1).float() * (0.5 + torch.rand(hidden))
+    g_svh = (torch.randint(0, 2, (inter,)) * 2 - 1).float() * (0.5 + torch.rand(inter))
+    u_svh = (torch.randint(0, 2, (inter,)) * 2 - 1).float() * (0.5 + torch.rand(inter))
+    d_suh = (torch.randint(0, 2, (inter,)) * 2 - 1).float() * (0.5 + torch.rand(inter))
+    d_svh = (torch.randint(0, 2, (hidden,)) * 2 - 1).float() * (0.5 + torch.rand(hidden))
+    pre_s = _rotation_signs(2 * inter, draw=3, axis=1, device=torch.device("cpu"))
+    post_s = _rotation_signs(inter, draw=3, axis=2, device=torch.device("cpu"))
+
+    logical = torch.stack((gate, up), dim=1).reshape(2 * inter, hidden)
+    raw = _block_hadamard(logical * pre_s[:, None], block_size=128, dim=0)
+    pair_sc = _atom_interleave(g_svh[None], u_svh[None])[0]
+    raw = _block_hadamard(raw / pair_sc[:, None], block_size=128, dim=0)
+    atoms = raw.shape[0] // 64
+    v = raw.reshape(atoms, 2, 32, hidden)
+    s0, s1 = v[:, 0].reshape(-1, hidden), v[:, 1].reshape(-1, hidden)
+    s0 = _block_hadamard(_block_hadamard(s0, block_size=512, dim=1) / suh[None], block_size=128, dim=1)
+    s1 = _block_hadamard(_block_hadamard(s1, block_size=512, dim=1) / suh[None], block_size=128, dim=1)
+    dc = _block_hadamard(_block_hadamard(down, block_size=512, dim=0) / d_svh[:, None], block_size=128, dim=0)
+    dc = _block_hadamard(_block_hadamard(dc * post_s[None], block_size=128, dim=1) / d_suh[None], block_size=128, dim=1)
+
+    g_rec, u_rec, d_rec = decode_coupled_scale_weights(
+        s0, s1, dc,
+        gate_up_suh=suh, gate_svh=g_svh, up_svh=u_svh, down_suh=d_suh, down_svh=d_svh,
+        intermediate_draw=3,
+    )
+    assert torch.allclose(g_rec, gate, atol=1e-5)
+    assert torch.allclose(u_rec, up, atol=1e-5)
+    assert torch.allclose(d_rec, down, atol=1e-5)
+
+    # 2. Gradient checkpointing preserves non-zero gradients into SharedHostNGramBank + checkpointed topk_kl_loss
+    class _CkptAttn(torch.nn.Module):
+        def __init__(self, h: int) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(h, h, bias=False)
+            self.k_proj = torch.nn.Linear(h, h, bias=False)
+            self.v_proj = torch.nn.Linear(h, h, bias=False)
+            self.o_proj = torch.nn.Linear(h, h, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.o_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
+
+    class _CkptBlock(torch.nn.Module):
+        def __init__(self, h: int) -> None:
+            super().__init__()
+            self.self_attn = _CkptAttn(h)
+            self.mlp = torch.nn.Linear(h, h, bias=False)
+            self.norm = torch.nn.LayerNorm(h)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + self.mlp(self.norm(self.self_attn(x)))
+
+    class _CkptModel(torch.nn.Module):
+        def __init__(self, h: int, v: int, n_layers: int) -> None:
+            super().__init__()
+            self.is_gradient_checkpointing = True
+            self.embed = torch.nn.Embedding(v, h)
+            self.layers = torch.nn.ModuleList([_CkptBlock(h) for _ in range(n_layers)])
+            self.norm = torch.nn.LayerNorm(h)
+            self.lm_head = torch.nn.Linear(h, v, bias=False)
+
+        def forward(self, input_ids: torch.Tensor, **_kw: object) -> torch.Tensor:
+            x = self.embed(input_ids)
+            for blk in self.layers:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            return self.lm_head(self.norm(x))
+
+    prof = ModelProfile(
+        name="ckpt-test",
+        hidden_size=32,
+        intermediate_size=64,
+        num_layers=2,
+        routed_layers=(0, 1),
+        num_experts=4,
+        top_k=2,
+        vocab_size=64,
+        tp_size=1,
+        layer_path_template="layers.{layer}",
+        moe_attr="mlp",
+        attn_attr="self_attn",
+        attn_projections=("q_proj", "k_proj", "v_proj", "o_proj"),
+        tie_word_embeddings=False,
+    )
+    m = _CkptModel(32, 64, 2)
+    qec = FullStackQEC(
+        m,
+        prof,
+        engram_layers=(0, 1),
+        engram_mode="v2_shared_banks",
+        engram_bank_groups={"early": [0, 1]},
+        engram_hook_target="mlp",
+        lora_rank=4,
+        engram_kwargs={"d_uni": 8, "d_bi": 4, "n_bi_heads": 2, "d_tri": 4, "n_tri_heads": 1, "d_skip": 4, "n_skip_heads": 1, "buckets": 31},
+        train_norms=True,
+        train_lm_head_lora=True,
+    )
+    qec.train()
+    assert m.training is True  # gradient checkpointing stays enabled
+    ids = torch.randint(0, 64, (1, 16))
+    with torch.no_grad():
+        base_logits = qec(ids)
+    tgt = base_logits.float() + 0.4 * torch.randn_like(base_logits.float())
+    t_lse = torch.logsumexp(tgt, dim=-1)
+    top_v, top_i = torch.topk(tgt, k=16, dim=-1)
+    top_lp = (top_v - t_lse.unsqueeze(-1)).clamp_max(0.0)
+    p_tail = (1.0 - top_lp.exp().sum(dim=-1)).clamp(0.0, 1.0)
+    opt = torch.optim.AdamW(qec.parameter_groups())
+    for _ in range(2):
+        opt.zero_grad()
+        loss = topk_kl_loss(qec(ids), top_lp, top_i, teacher_p_tail=p_tail, chunk_tokens=4)
+        loss.backward()
+        opt.step()
+    assert qec.banks["early"].uni_emb.weight.grad is not None
+    assert float(qec.banks["early"].uni_emb.weight.grad.abs().sum()) > 0.0
+    assert float(qec.banks["early"].bi_embs[0].weight.grad.abs().sum()) > 0.0
+    assert float(qec.loras["lm_head"].a.weight.grad.abs().sum()) > 0.0
+
+    # Quantized BF16/FP8 table inplace parity + restore
+    bak = qec.quantize_engram_tables_inplace(torch.float8_e4m3fn)
+    qec.restore_engram_tables(bak)
+    qec.remove_hooks()
+
+    # 3. Local Inference Lab BCa + Wilson + alignment + perplexity ratio
+    t_log = torch.randn(40, 64)
+    s_log = t_log + 0.1 * torch.randn(40, 64)
+    realized = t_log.argmax(dim=-1)
+    realized[::2] = (realized[::2] + 1) % 64  # 50% realized alignment
+    kld, agree, tlp, slp, hits = tokenwise_kld_and_alignment_fp64(t_log, s_log, realized, vocab_limit=64)
+    summ = summarize_windows(
+        [kld[:10], kld[10:20], kld[20:30], kld[30:]],
+        [agree[:10], agree[10:20], agree[20:30], agree[30:]],
+        window_teacher_logp=[tlp[:10], tlp[10:20], tlp[20:30], tlp[30:]],
+        window_student_logp=[slp[:10], slp[10:20], slp[20:30], slp[30:]],
+        window_teacher_hits=[hits[:10], hits[10:20], hits[20:30], hits[30:]],
+        resamples=1000,
+    )
+    assert summ.ci95_low <= summ.mean_kld <= summ.ci95_high
+    assert summ.top1_wilson95_low_pct <= summ.top1_agreement_pct <= summ.top1_wilson95_high_pct
+    assert summ.realized_alignment_rate is not None and 0.45 <= summ.realized_alignment_rate <= 0.55
+    assert summ.perplexity_ratio is not None and summ.perplexity_ratio > 0.5
