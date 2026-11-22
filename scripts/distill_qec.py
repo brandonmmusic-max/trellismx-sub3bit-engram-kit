@@ -55,18 +55,40 @@ from trellismx_kit.profile import ModelProfile, load_profile
 class _ShardStream:
     """Sequential reader over pre-dumped sparse top-K teacher logit shards."""
 
-    def __init__(self, shard_dir: str | Path) -> None:
-        self.paths = sorted(Path(shard_dir).glob("*.pt"))
+    def __init__(self, shard_dir: str | Path, *, count_rows: bool = False) -> None:
+        self.shard_dir = Path(shard_dir)
+        self.paths = sorted(self.shard_dir.glob("*.pt"))
         if not self.paths:
             raise FileNotFoundError(f"no .pt teacher shards found under {shard_dir}")
         self._shard_idx = 0
         self._row_idx = 0
         self._cur = self._load(0)
         self.seq_len = int(self._cur["token_ids"].shape[1])
-        self.total_rows = sum(
-            int(torch.load(p, map_location="cpu", weights_only=True)["token_ids"].shape[0])
-            for p in self.paths
-        )
+        self.total_rows = self._resolve_total_rows() if count_rows else 0
+
+    def _resolve_total_rows(self) -> int:
+        # Prefer teacher_logits_manifest.json when present to avoid loading every shard at startup.
+        manifest_path = self.shard_dir.parent / "teacher_logits_manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                name = self.shard_dir.name
+                if name in manifest and isinstance(manifest[name], dict) and "rows" in manifest[name]:
+                    return int(manifest[name]["rows"])
+                tl = manifest.get("train_long")
+                if isinstance(tl, dict):
+                    if name in tl and isinstance(tl[name], dict) and "rows" in tl[name]:
+                        return int(tl[name]["rows"])
+                    if name == "train_long" and "rows" in tl:
+                        return int(tl["rows"])
+            except Exception:
+                pass
+        first_rows = int(self._cur["token_ids"].shape[0])
+        if len(self.paths) == 1:
+            return first_rows
+        # Non-final shards from dump_teacher_logits share rows_per_shard; only read the last shard.
+        last_rows = int(torch.load(self.paths[-1], map_location="cpu", weights_only=True)["token_ids"].shape[0])
+        return first_rows * (len(self.paths) - 1) + last_rows
 
     def state_dict(self) -> dict[str, int]:
         return {"shard_idx": self._shard_idx, "row_idx": self._row_idx}
@@ -127,7 +149,7 @@ class _MultiLengthShardStream:
     """Round-robin reader across one or more homogeneous shard directories (e.g. 16K, 32K, 64K)."""
 
     def __init__(self, shard_dirs: list[str | Path]) -> None:
-        self.streams = [_ShardStream(d) for d in shard_dirs]
+        self.streams = [_ShardStream(d, count_rows=True) for d in shard_dirs]
         if not self.streams:
             raise ValueError("at least one shard directory is required")
         # Interleave shard directories proportionally by actual row count so every milestone sees all lengths
@@ -381,11 +403,22 @@ def evaluate_dense_dir(
         t_hits: list[torch.Tensor] = []
         self_checked = False
         for p in split_paths:
-            rec = torch.load(p, map_location="cpu", weights_only=True)
-            token_ids = rec["token_ids"]
+            rec = None
+            if is_writer or not dist.is_initialized():
+                rec = torch.load(p, map_location="cpu", weights_only=True)
+                token_ids = rec["token_ids"]
+            else:
+                token_ids = None
+            if dist.is_initialized():
+                obj = [token_ids]
+                dist.broadcast_object_list(obj, src=0)
+                token_ids = obj[0]
+            assert token_ids is not None
             ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-            s_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1].cpu()
+            out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
             if is_writer:
+                assert rec is not None
+                s_logits = out_logits.cpu()
                 t_logits = rec["logits"]
                 if self_check and not self_checked:
                     self_kld, _ = tokenwise_kld_fp64(t_logits, t_logits, vocab_limit=vocab_limit)
@@ -400,7 +433,8 @@ def evaluate_dense_dir(
                 t_lps.append(t_lp)
                 s_lps.append(s_lp)
                 t_hits.append(hit)
-            del ids, s_logits
+                del s_logits, t_logits
+            del ids, out_logits, rec
         if is_writer and klds:
             summ = summarize_windows(
                 klds,
@@ -687,11 +721,46 @@ def main() -> None:
         qec = qec.to(device)
     qec.train()
 
+    if distributed and args.distributed_ep and (args.train_inter_scales or args.train_expert_bias):
+        raise ValueError(
+            "--distributed-ep with synchronized replicated QEC cannot be combined with EP-sharded "
+            "--train-inter-scales or --train-expert-bias; omit both flags for replicated QEC."
+        )
     if distributed and (not args.device_map_auto) and (not args.distributed_ep) and (table_dev is not None):
         raise ValueError("DDP training cannot combine --engram-table-device cpu with multi-rank torchrun")
     use_ddp = distributed and (not args.device_map_auto) and (not args.distributed_ep) and (table_dev is None)
+    use_ep_sync = distributed and args.distributed_ep
     model_run: torch.nn.Module = DDP(qec, device_ids=[local_rank]) if use_ddp else qec
     param_groups = qec.parameter_groups()
+    trainable_params = [p for g in param_groups for p in g["params"]]
+
+    def _sync_ep_qec_params() -> None:
+        """Broadcast all replicated QEC parameters and hash buffers from rank 0."""
+        if not use_ep_sync:
+            return
+        with torch.no_grad():
+            for p in trainable_params:
+                if hasattr(p.data, "to_local"):
+                    raise RuntimeError(
+                        "Found sharded DTensor in replicated QEC trainable_params under --distributed-ep"
+                    )
+                if p.data.is_cuda:
+                    dist.broadcast(p.data, src=0)
+                else:
+                    buf_gpu = p.data.to(device=device)
+                    dist.broadcast(buf_gpu, src=0)
+                    p.data.copy_(buf_gpu.cpu())
+            for buf in list(qec.banks.buffers()) + list(qec.engrams.buffers()):
+                if buf is None:
+                    continue
+                if buf.is_cuda:
+                    dist.broadcast(buf, src=0)
+                else:
+                    buf_gpu = buf.to(device=device)
+                    dist.broadcast(buf_gpu, src=0)
+                    buf.copy_(buf_gpu.cpu())
+
+    _sync_ep_qec_params()
     opt = torch.optim.AdamW(param_groups)
 
     short_chunks_per_step = dp_world * args.batch_size * args.grad_accum
@@ -757,6 +826,7 @@ def main() -> None:
         seen_m = (short_tokens_seen + long_tokens_seen) / 1e6
         while next_milestone_idx < len(milestones_m) and milestones_m[next_milestone_idx] <= seen_m + 1e-6:
             next_milestone_idx += 1
+        _sync_ep_qec_params()
 
     if eval_dir is not None and start_step == 0 and stock_baseline_eval is not None:
         if is_writer:
@@ -860,7 +930,17 @@ def main() -> None:
                 loss.backward()
                 acc_loss += float(loss.item())
 
-        torch.nn.utils.clip_grad_norm_([p for g in param_groups for p in g["params"]], 1.0)
+        if use_ep_sync:
+            for p in trainable_params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p.data)
+                if p.grad.is_cuda:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                else:
+                    g_gpu = p.grad.to(device=device)
+                    dist.all_reduce(g_gpu, op=dist.ReduceOp.AVG)
+                    p.grad.copy_(g_gpu.cpu())
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         opt.step()
         sched.step()
         if is_long:
