@@ -88,6 +88,11 @@ def load_hf_model(
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
 
+        # Keep pure EP on experts + lm_head TP only; avoids upstream hybrid linear_attention o_proj TP mismatch
+        cfg.base_model_tp_plan = None
+        if hasattr(cfg, "text_config") and cfg.text_config is not None:
+            cfg.text_config.base_model_tp_plan = None
+        kwargs["config"] = cfg
         try:
             kwargs["distributed_config"] = DistributedConfig(
                 ep_size=world_size,

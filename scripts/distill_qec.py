@@ -209,6 +209,10 @@ def _load_model(
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
 
+        cfg.base_model_tp_plan = None
+        if hasattr(cfg, "text_config") and cfg.text_config is not None:
+            cfg.text_config.base_model_tp_plan = None
+        kwargs["config"] = cfg
         try:
             kwargs["distributed_config"] = DistributedConfig(
                 ep_size=world_size,
@@ -224,7 +228,9 @@ def _load_model(
                 pp_size=1,
                 enable_expert_parallel=True,
             )
-        return loader.from_pretrained(model_path, **kwargs)
+        model = loader.from_pretrained(model_path, **kwargs)
+        patch_glm5_long_context(model)
+        return model
     if device_map_auto:
         kwargs["device_map"] = "auto"
         n_gpu = torch.cuda.device_count()
