@@ -27,7 +27,7 @@
  }
 --- a/kquant/csrc/sqg_quantize.cu
 +++ b/kquant/csrc/sqg_quantize.cu
-@@ -124,6 +124,163 @@
+@@ -124,6 +124,168 @@
  namespace
  {
  
@@ -48,13 +48,15 @@
 +    float* input = reinterpret_cast<float*>(pair_shared);
 +    float* min_values = reinterpret_cast<float*>(input + kSymbols * 2);
 +    int* min_indices = reinterpret_cast<int*>(min_values + 32);
++    float* best_prev_smem = reinterpret_cast<float*>(min_indices + 32);
 +
 +    const int tile = blockIdx.x;
 +    const int thread = threadIdx.x;
 +    const float* input_tile = input_tiles_ptr + 256 * tile;
 +    float* output_tile = output_tiles_ptr + 256 * tile;
 +    uint16_t* output_symbols = output_symbols_ptr + kSymbols * tile;
-+    uint8_t* decisions = temp_edges_ptr + kSymbols * kStates * tile;
++    constexpr int kBases = 2048;
++    uint8_t* decisions = temp_edges_ptr + kSymbols * kBases * tile;
 +    float* costs = temp_costs_ptr + 2 * kStates * tile;
 +    float* costs_inc = costs + kStates;
 +
@@ -83,20 +85,23 @@
 +        __syncthreads();
 +        for (int step = 0; step < steps; ++step) {
 +            const int symbol = (step + roll) & (kSymbols - 1);
-+            for (int state = thread; state < kStates; state += 1024) {
++            for (int base = thread; base < kBases; base += 1024) {
 +                int best_predecessor = 0;
-+                float best_cost = INFINITY;
-+                const float emission_cost = branch_cost(state, symbol);
++                float best_prev = INFINITY;
++                #pragma unroll 8
 +                for (int predecessor = 0; predecessor < kPredecessors; ++predecessor) {
-+                    const int previous = (predecessor << kShift) | (state >> 5);
-+                    const float cost = current[previous] + emission_cost;
-+                    if (cost < best_cost) {
-+                        best_cost = cost;
++                    const float c = current[(predecessor << kShift) | base];
++                    if (c < best_prev) {
++                        best_prev = c;
 +                        best_predecessor = predecessor;
 +                    }
 +                }
-+                next[state] = best_cost;
-+                decisions[symbol * kStates + state] = static_cast<uint8_t>(best_predecessor);
++                best_prev_smem[base] = best_prev;
++                decisions[symbol * kBases + base] = static_cast<uint8_t>(best_predecessor);
++            }
++            __syncthreads();
++            for (int state = thread; state < kStates; state += 1024) {
++                next[state] = best_prev_smem[state >> 5] + branch_cost(state, symbol);
 +            }
 +            __syncthreads();
 +            float* swap = current;
@@ -144,7 +149,7 @@
 +        for (int step = 2 * tailbite_context - 1; step >= 0; --step) {
 +            const int symbol = (step + kSymbols - tailbite_context) & (kSymbols - 1);
 +            primer_symbols[step] = state & 31;
-+            const int predecessor = decisions[symbol * kStates + state];
++            const int predecessor = decisions[symbol * kBases + (state >> 5)];
 +            state = (predecessor << kShift) | (state >> 5);
 +        }
 +        int boundary_full = 0;
@@ -172,7 +177,7 @@
 +            return;
 +        }
 +        for (int symbol = kSymbols - 1; symbol >= 0; --symbol) {
-+            const int predecessor = decisions[symbol * kStates + state];
++            const int predecessor = decisions[symbol * kBases + (state >> 5)];
 +            const int previous = (predecessor << kShift) | (state >> 5);
 +            const int encoded = state;
 +            output_symbols[symbol] = static_cast<uint16_t>(encoded & 31);
@@ -191,7 +196,7 @@
  template <int K, int codebook>
  void launch_trellis(
      const float* input,
-@@ -160,8 +317,87 @@
+@@ -160,8 +322,88 @@
      }
  }
  
@@ -208,6 +213,7 @@
 +    const int shared_memory = 256 * static_cast<int>(sizeof(float))
 +        + 32 * static_cast<int>(sizeof(float))
 +        + 32 * static_cast<int>(sizeof(int))
++        + 2048 * static_cast<int>(sizeof(float))
 +        + sizeof(int);
 +    quantize_pair_tiles_kernel<<<tiles, 1024, shared_memory, stream>>>(
 +        input,
