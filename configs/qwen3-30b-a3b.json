@@ -1,0 +1,22 @@
+{
+  "schema": "trellismx.model-profile.v1",
+  "name": "Qwen/Qwen3-30B-A3B",
+  "hidden_size": 2048,
+  "intermediate_size": 768,
+  "num_layers": 48,
+  "routed_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+  "num_experts": 128,
+  "top_k": 8,
+  "vocab_size": 151936,
+  "tp_size": 2,
+  "rates": ["k2", "p25", "k3", "k4"],
+  "mtp_layers": [],
+  "non_routed_params": 1500000000,
+  "layer_path_template": "model.layers.{layer}",
+  "moe_attr": "mlp",
+  "attn_attr": "self_attn",
+  "attn_projections": ["q_proj", "k_proj", "v_proj", "o_proj"],
+  "expert_layout": "per_expert_linear",
+  "logits_scaling": 1.0,
+  "activation": "silu"
+}

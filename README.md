@@ -1,0 +1,74 @@
+# TrellisMX Sub-3-Bit Per-Expert Quantization and Host-RAM Engram QEC Kit
+
+Model-neutral toolkit, format specifications, kernel patches, and empirical KLD
+benchmarks for compressing large Mixture-of-Experts (MoE) language models below
+3 bits per routed-expert weight without expert weight offloading to host RAM.
+
+Target deployment envelope: fitting 1T+ parameter MoE checkpoints onto four
+96 GB GPUs (382 GiB VRAM) with 512 GB host DDR5 while preserving decode speed.
+
+## Three-layer recipe
+
+1. **Per-expert four-rate TrellisMX codec (`k2`, `p25`, `k3`, `k4`).**
+   Every routed expert receives one shared rate across both `w13` (gate and up)
+   and `w2` (down), selected under an exact byte budget by a two-level
+   hierarchical allocator (`layer_sensitivity[l] * expert_route_mass[l, e] *
+   rd_ratio[rate]`, with optional `k4` cap for top hot experts) or reconciled
+   Aumann-Shapley shares. Encoding uses standard local GPTQ column-block error
+   feedback inside the coupled Hadamard serving boundary (`procedural-npk`
+   zero-storage E4M3 state law, `compander_scale = 2.0`, 5-pass continuous-to-
+   UE8M0 scale refit, tail-biting Viterbi search, lossless CSF scale planes).
+   YAQA-style two-sided Fisher rounding is excluded (measured 1% to 6% worse
+   on Granite 3.1 3B).
+2. **Mergeable non-expert QEC (zero extra VRAM, zero extra inference latency).**
+   With all quantized MoE experts and routers permanently frozen, rank-32 LoRA
+   adapters on BF16/FP8 attention projections (`q_proj`, `k_proj`, `v_proj`,
+   `o_proj`), RMSNorm scale weights, and optional per-expert scalar gains
+   distill against top-64 teacher KL divergence. After distillation, attention
+   LoRA deltas merge algebraically into the attention weight matrices.
+3. **Host-RAM Engram QEC sidecar (zero GPU expert VRAM, O(1) deterministic prefetch).**
+   Context-gated unigram plus multi-head prime-hashed bigram and trigram lookup
+   tables attach as zero-initialized residual branches at selected layers
+   (`h + alpha(h, k) * v`). Hash addresses depend exclusively on input token
+   IDs `(t_{i-2}, t_{i-1}, t_i)`, allowing deterministic prefetch from host DDR5
+   before Layer 0 executes.
+
+## Repository layout
+
+| Path | Content | Status |
+|---|---|---|
+| `configs/*.json` | Model profiles (`granite-3.1-3b-a800m`, `glm-5.3-flash`, `qwen3-30b-a3b`, `template-1t-moe`) | implemented |
+| `trellismx_kit/profile.py` | `ModelProfile` schema and validator for arbitrary MoE geometries | implemented |
+| `trellismx_kit/trellis_ref.py` | Standalone `procedural-npk` packer and decoder for `k2`, `p25`, `k3`, `k4` | implemented |
+| `trellismx_kit/pe_format.py` | Four-bank rank sidecar writer/reader, lossless CSF scales, device layout | implemented |
+| `trellismx_kit/allocate.py` | Exact multiple-choice DP allocator (hierarchical, route-mass, K4 cap) | implemented |
+| `trellismx_kit/stratified_capture.py` | Calibration window selector enforcing rare-expert routed-token floors | implemented |
+| `trellismx_kit/layer_sensitivity.py` | Fast per-layer KLD perturbation sensitivity probe | implemented |
+| `trellismx_kit/engram_qec.py` | Mergeable Attention LoRA + context-gated Host-RAM Engram QEC | implemented |
+| `trellismx_kit/engram_probe.py` | Training-free n-gram predictability (`R^2`, NMSE) diagnostic | implemented |
+| `trellismx_kit/kld_score.py` | Exact FP64 full-vocabulary KL scorer and window-block bootstrap CI | implemented |
+| `trellismx_kit/vram_budget.py` | GPU VRAM and host-RAM sizing calculator | implemented |
+| `scripts/distill_qec.py` | Model-neutral DDP CLI for Full-Stack QEC distillation and LoRA merge | implemented |
+| `design/` | Format, four-rate P8 kernel, and Engram QEC specifications | implemented |
+| `patches/` | `b12x-per-expert.patch` (qualified on SM120 synthetic layers for `{k2, p25, k3, k4}`), `kquant-pair.patch`, `flare-per-expert.patch` | SM120 kernel verified |
+| `results/` | Machine-readable JSON summary of Granite 3.1 3B empirical sweeps | qualified on Granite 3B |
+| `RESULTS.md` | Full Granite 3.1 3B empirical measurements (per-expert, zero-train LUT, 10M and 50M QEC) | qualified on Granite 3B |
+| `AGENT_RUNBOOK.md` | Step-by-step workflow for quantizing an arbitrary MoE checkpoint | implemented |
+| `tests/test_kit.py` | CPU unit and invariant test suite (`pytest`) | implemented |
+
+## Quick check
+
+```bash
+pytest -v tests/test_kit.py
+python3 -m trellismx_kit.vram_budget --profile configs/template-1t-moe.json --avg-expert-bits 2.25 --gpus 4
+```
+
+## Credits and precedents
+
+Built on prior open research and software: IBM Granite 3.1 3B-A800M-Instruct
+(test model), NVIDIA Nemotron and Nebius SWE-agent datasets (calibration and
+evaluation text), ExLlamaV3 / turboderp (EXL3 trellis lineage), QTIP
+(`arXiv:2406.11235`), Q-Palette (`arXiv:2509.20214`), DeepSeek Engram
+(`arXiv:2601.07372`), Mixture of Lookup Experts (`arXiv:2503.15798`), MC-MoE
+(`arXiv:2410.06270`), GEMQ (`arXiv:2605.23078`), Q-Strata (`arXiv:2608.30564`),
+Hill (`arXiv:2607.12266`), and the Local Inference Lab b12x kernel contributors.

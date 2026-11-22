@@ -1,0 +1,3220 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/fused_moe/_impl.py kernel/b12x/moe/fused_moe/_impl.py
+--- ref/b12x-trellismx/b12x/moe/fused_moe/_impl.py	2026-11-11 22:30:27.689540885 -0500
++++ kernel/b12x/moe/fused_moe/_impl.py	2026-11-12 22:44:58.920324451 -0500
+@@ -11632,6 +11632,9 @@
+         stream: cuda.CUstream,
+         trellis_lut_ptr: cute.Pointer | None = None,
+         trellis_rot_ptr: cute.Pointer | None = None,
++        expert_rate_ptr: cute.Pointer | None = None,
++        w13_expert_base_ptr: cute.Pointer | None = None,
++        w2_expert_base_ptr: cute.Pointer | None = None,
+     ):
+         a_input = cute.make_tensor(
+             a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
+@@ -11917,6 +11920,30 @@
+                 if cutlass.const_expr(trellis_rot_ptr is not None)
+                 else None
+             ),
++            expert_rate=(
++                cute.make_tensor(
++                    expert_rate_ptr,
++                    layout=cute.make_layout((num_experts,), stride=(1,)),
++                )
++                if cutlass.const_expr(expert_rate_ptr is not None)
++                else None
++            ),
++            w13_expert_base=(
++                cute.make_tensor(
++                    w13_expert_base_ptr,
++                    layout=cute.make_layout((2 * num_experts,), stride=(1,)),
++                )
++                if cutlass.const_expr(w13_expert_base_ptr is not None)
++                else None
++            ),
++            w2_expert_base=(
++                cute.make_tensor(
++                    w2_expert_base_ptr,
++                    layout=cute.make_layout((num_experts,), stride=(1,)),
++                )
++                if cutlass.const_expr(w2_expert_base_ptr is not None)
++                else None
++            ),
+         )
+ 
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/fused_moe/trellismx_p8.py kernel/b12x/moe/fused_moe/trellismx_p8.py
+--- ref/b12x-trellismx/b12x/moe/fused_moe/trellismx_p8.py	2026-11-11 22:30:27.690050414 -0500
++++ kernel/b12x/moe/fused_moe/trellismx_p8.py	2026-11-12 22:37:21.647740933 -0500
+@@ -379,6 +379,7 @@
+     intermediate_size: int
+     top_k: int
+     bits: int
++    rate_set: tuple[str, ...] = ()
+     io_dtype: torch.dtype = torch.bfloat16
+     activation: str = "silu"
+     swiglu_limit: float = _SWIGLU_LIMIT
+@@ -395,6 +396,7 @@
+             "intermediate_size": int(self.intermediate_size),
+             "top_k": int(self.top_k),
+             "bits": int(self.bits),
++            "rate_set": list(self.rate_set),
+             "io_dtype": str(self.io_dtype).removeprefix("torch."),
+             "activation": self.activation,
+             "swiglu_limit": float(self.swiglu_limit),
+@@ -490,6 +492,7 @@
+     "intermediate",
+     "topk",
+     "trellis_bits",
++    "rate_set",
+     "swiglu_limit",
+     "full_coupled",
+     "deterministic_output",
+@@ -1022,6 +1025,7 @@
+         intermediate_size=impl.intermediate_size,
+         top_k=int(_attribute(runtime, "topk")),
+         bits=int(record.trellis_bits),
++        rate_set=tuple(_attribute(runtime, "rate_set")),
+     )
+     _require(
+         torch.device(_attribute(runtime, "device")) == device,
+@@ -1262,6 +1266,7 @@
+     top_k: int
+     num_tokens: int
+     bits: int
++    rate_set: tuple[str, ...] = ()
+     direct_tokens: int
+     mac_pin: int = 0
+     io_dtype: str = "bfloat16"
+@@ -1661,6 +1666,7 @@
+             top_k=contract.top_k,
+             num_tokens=int(tokens),
+             bits=contract.bits,
++            rate_set=contract.rate_set,
+             direct_tokens=direct_tokens,
+             mac_pin=0 if spec.mac_override is None else int(spec.mac_override),
+         )
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/fused_moe/trellismx.py kernel/b12x/moe/fused_moe/trellismx.py
+--- ref/b12x-trellismx/b12x/moe/fused_moe/trellismx.py	2026-11-11 22:30:27.690035542 -0500
++++ kernel/b12x/moe/fused_moe/trellismx.py	2026-11-21 22:09:12.808789798 -0500
+@@ -71,6 +71,11 @@
+ ACTIVATION = "silu-cap10"
+ SUPPORTED_BITS = (2, 3, 4)
+ SLOT_CHANNELS = 32
++PER_EXPERT_SCHEMA = "glm53-p8-coupled-h512-h128-tp4-rank-per-expert.v1"
++PER_EXPERT_RATES = ("k2", "p25", "k3", "k4")
++PER_EXPERT_TILE_U32 = {"k2": 16, "p25": 20, "k3": 24, "k4": 32}
++PAIR_MIX_MULTIPLIER = 1664525
++PAIR_MIX_INCREMENT = 1013904223
+ 
+ #: Projection block of the coupled boundary's outer (hidden) Hadamard stage.
+ PROJECTION_BLOCK = 512
+@@ -79,6 +84,10 @@
+ 
+ #: Sidecar tensor names, by container family.
+ CARRIER_NAMES = ("w13_trellis", "w2_trellis")
++PER_EXPERT_CARRIER_NAMES = tuple(
++    f"{carrier}_{rate}" for carrier in CARRIER_NAMES for rate in PER_EXPERT_RATES
++)
++PER_EXPERT_TABLE_NAMES = ("expert_rate_u8", "expert_slot_u16")
+ PLAIN_SCALE_NAMES = ("w13_scale_ue8m0", "w2_scale_ue8m0")
+ CSF_SCALE_NAMES = ("w13_scale.mxfp4_csf_fixed", "w2_scale.mxfp4_csf_fixed")
+ CSF_EXCEPTION_NAMES = (
+@@ -175,6 +184,8 @@
+     slot_count: int
+     top_k: int
+     scale_storage: str | None = None
++    per_expert_rates: bool = False
++    per_expert_counts: tuple[int, ...] = (0, 0, 0, 0)
+ 
+     @classmethod
+     def from_sidecar(
+@@ -232,11 +243,43 @@
+             raise ValueError(
+                 f"TrellisMX activation must be {ACTIVATION!r}; got {activation!r}"
+             )
+-        bits = _int_field(metadata, "bits")
+-        if bits not in SUPPORTED_BITS:
+-            raise ValueError(
+-                f"TrellisMX bits must be one of {list(SUPPORTED_BITS)}; got {bits}"
++        per_expert_rates = metadata.get("schema") == PER_EXPERT_SCHEMA
++        if per_expert_rates:
++            raw_rate_set = str(metadata.get("rate_set", "")).split(",")
++            if (
++                len(raw_rate_set) < 2
++                or len(set(raw_rate_set)) != len(raw_rate_set)
++                or not (set(raw_rate_set) <= set(PER_EXPERT_RATES))
++            ):
++                raise ValueError(
++                    "per-expert TrellisMX rate_set must be a subset of "
++                    f"{PER_EXPERT_RATES}; got {metadata.get('rate_set')!r}"
++                )
++            if (
++                _int_field(metadata, "pair_mix_multiplier") != PAIR_MIX_MULTIPLIER
++                or _int_field(metadata, "pair_mix_increment") != PAIR_MIX_INCREMENT
++            ):
++                raise ValueError(
++                    "per-expert TrellisMX pair mix constants must be "
++                    f"{PAIR_MIX_MULTIPLIER} and {PAIR_MIX_INCREMENT}"
++                )
++            bits = 4 if "k4" in raw_rate_set else 3
++            per_expert_counts = tuple(
++                _int_field(metadata, f"experts_{name}", default=0)
++                for name in PER_EXPERT_RATES
+             )
++            if sum(per_expert_counts) != num_experts:
++                raise ValueError(
++                    "per-expert TrellisMX rate counts must sum to the expert count; "
++                    f"got {per_expert_counts} for {num_experts}"
++                )
++        else:
++            bits = _int_field(metadata, "bits")
++            if bits not in SUPPORTED_BITS:
++                raise ValueError(
++                    f"TrellisMX bits must be one of {list(SUPPORTED_BITS)}; got {bits}"
++                )
++            per_expert_counts = (0, 0, 0, 0)
+ 
+         # ---- geometry -----------------------------------------------------
+         # The caller declares the rank-local shape it is loading; a container
+@@ -335,6 +378,8 @@
+             slot_count=slot_count,
+             top_k=topk,
+             scale_storage=None if storage is None else str(storage),
++            per_expert_rates=per_expert_rates,
++            per_expert_counts=per_expert_counts,
+         )
+ 
+     def config(self) -> TrellisConfig:
+@@ -822,6 +867,22 @@
+             raise TypeError("TrellisMxWeights.expert_sign_patterns must be a tensor")
+ 
+ 
++@dataclass(frozen=True)
++class TrellisMxPerExpertWeights:
++    """Rank-local TrellisMX tensors with one banked rate per expert."""
++
++    w13_banks: Mapping[str, torch.Tensor]
++    w2_banks: Mapping[str, torch.Tensor]
++    expert_rates: torch.Tensor
++    expert_slots: torch.Tensor
++    w13_scale: torch.Tensor
++    w2_scale: torch.Tensor
++    input_scales: ScaleFactors
++    intermediate_scales: ScaleFactors
++    output_scales: ScaleFactors
++    expert_sign_patterns: torch.Tensor
++
++
+ def _require(
+     tensors: Mapping[str, torch.Tensor],
+     name: str,
+@@ -867,7 +928,13 @@
+ 
+     if not isinstance(tensors, Mapping):
+         raise TypeError("TrellisMX tensors must be a mapping")
+-    known = set(CARRIER_NAMES) | set(PLAIN_SCALE_NAMES) | set(CSF_SCALE_NAMES)
++    known = (
++        set(CARRIER_NAMES)
++        | set(PER_EXPERT_CARRIER_NAMES)
++        | set(PER_EXPERT_TABLE_NAMES)
++        | set(PLAIN_SCALE_NAMES)
++        | set(CSF_SCALE_NAMES)
++    )
+     known |= set(CSF_EXCEPTION_NAMES) | set(BOUNDARY_NAMES) | set(OPTIONAL_NAMES)
+     unknown = sorted(set(tensors) - known)
+     if unknown:
+@@ -881,18 +948,59 @@
+     hidden_tiles = hidden // 16
+     local_tiles = local // 16
+     stream_words = 16 * bits
+-    _require(
+-        tensors,
+-        "w13_trellis",
+-        dtype=torch.int16,
+-        shape=(2, experts, hidden_tiles, local_tiles, stream_words),
+-    )
+-    _require(
+-        tensors,
+-        "w2_trellis",
+-        dtype=torch.int16,
+-        shape=(experts, local_tiles, hidden_tiles, stream_words),
+-    )
++    if meta.per_expert_rates:
++        rates = _require(tensors, "expert_rate_u8", dtype=torch.uint8, shape=(experts,))
++        slots = _require(
++            tensors, "expert_slot_u16", dtype=torch.int16, shape=(experts,)
++        )
++        for index, rate in enumerate(PER_EXPERT_RATES):
++            count = meta.per_expert_counts[index]
++            if int((rates == index).sum()) != count:
++                raise ValueError(
++                    f"per-expert TrellisMX {rate} tensor count does not match metadata"
++                )
++            words = 2 * PER_EXPERT_TILE_U32[rate]
++            if count:
++                _require(
++                    tensors,
++                    f"w13_trellis_{rate}",
++                    dtype=torch.int16,
++                    shape=(2, count, hidden_tiles, local_tiles, words),
++                )
++                _require(
++                    tensors,
++                    f"w2_trellis_{rate}",
++                    dtype=torch.int16,
++                    shape=(count, local_tiles, hidden_tiles, words),
++                )
++            else:
++                if f"w13_trellis_{rate}" in tensors or f"w2_trellis_{rate}" in tensors:
++                    raise ValueError(
++                        f"empty per-expert TrellisMX {rate} bank carries tensors"
++                    )
++        seen_slots = [0] * len(PER_EXPERT_RATES)
++        for expert in range(experts):
++            code = int(rates[expert])
++            if code not in range(len(PER_EXPERT_RATES)):
++                raise ValueError(f"invalid per-expert TrellisMX rate code {code}")
++            if int(slots[expert]) != seen_slots[code]:
++                raise ValueError(
++                    "per-expert TrellisMX slots must be ascending inside each bank"
++                )
++            seen_slots[code] += 1
++    else:
++        _require(
++            tensors,
++            "w13_trellis",
++            dtype=torch.int16,
++            shape=(2, experts, hidden_tiles, local_tiles, stream_words),
++        )
++        _require(
++            tensors,
++            "w2_trellis",
++            dtype=torch.int16,
++            shape=(experts, local_tiles, hidden_tiles, stream_words),
++        )
+     _require(
+         tensors,
+         "intermediate_scales_fp16",
+@@ -1033,7 +1141,7 @@
+     *,
+     verify_sha256: bool = False,
+     metadata: Mapping[str, object] | None = None,
+-) -> TrellisMxWeights:
++) -> TrellisMxWeights | TrellisMxPerExpertWeights:
+     """Validate one sidecar and assemble its container-independent bundle."""
+ 
+     validate_trellismx_tensors(
+@@ -1068,8 +1176,30 @@
+     if signs is None:
+         # A container without a sign draw uses draw 0 (all +1); follow the
+         # carriers' device so a CUDA-staged sidecar stays on device.
+-        signs = torch.zeros(
+-            experts, dtype=torch.uint8, device=tensors["w13_trellis"].device
++        carrier_device = next(iter(tensors.values())).device
++        signs = torch.zeros(experts, dtype=torch.uint8, device=carrier_device)
++    if meta.per_expert_rates:
++        return TrellisMxPerExpertWeights(
++            w13_banks={
++                rate: tensors[f"w13_trellis_{rate}"]
++                for rate in PER_EXPERT_RATES
++                if f"w13_trellis_{rate}" in tensors
++            },
++            w2_banks={
++                rate: tensors[f"w2_trellis_{rate}"]
++                for rate in PER_EXPERT_RATES
++                if f"w2_trellis_{rate}" in tensors
++            },
++            expert_rates=tensors["expert_rate_u8"],
++            expert_slots=tensors["expert_slot_u16"],
++            w13_scale=w13_scale,
++            w2_scale=w2_scale,
++            input_scales=ScaleFactors(tensors["gate_up_suh_fp16"]),
++            intermediate_scales=ScaleFactors(
++                tensors["intermediate_scales_fp16"].reshape(experts, 3, local)
++            ),
++            output_scales=ScaleFactors(tensors["down_svh_fp16"]),
++            expert_sign_patterns=signs,
+         )
+     return TrellisMxWeights(
+         w13=tensors["w13_trellis"],
+@@ -1169,6 +1299,9 @@
+     "TrellisMxBoundaryOps",
+     "TrellisMxMetadata",
+     "TrellisMxWeights",
++    "TrellisMxPerExpertWeights",
++    "PER_EXPERT_RATES",
++    "PER_EXPERT_SCHEMA",
+     "build_trellismx_weights",
+     "csf_scale_source",
+     "decode_csf_scale_plane",
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/dynamic/kernel.py kernel/b12x/moe/_shared/kernels/dynamic/kernel.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/dynamic/kernel.py	2026-11-11 22:30:27.683656210 -0500
++++ kernel/b12x/moe/_shared/kernels/dynamic/kernel.py	2026-11-12 22:24:39.372296039 -0500
+@@ -2306,6 +2306,9 @@
+         down_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
+         trellis_lut: cute.Tensor | None = None,  # 4 KiB lut_e4m3 value table (u8)
+         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
++        expert_rate: cute.Tensor | None = None,
++        w13_expert_base: cute.Tensor | None = None,
++        w2_expert_base: cute.Tensor | None = None,
+     ):
+         """Build TMA descriptors for the bound tensors and launch the persistent
+         kernel.
+@@ -2725,27 +2728,52 @@
+                 # grouped task metadata.
+                 if cutlass.const_expr(self.p8_small_m or self.p8_fc1_tile_n != 128):
+                     phase1_experts = topk_ids
+-                self.materialized_phase1_kernel(
+-                    packed_a_storage,
+-                    scale_storage,
+-                    w13_rp,
+-                    w13_sfb_rp,
+-                    intermediate_u32,
+-                    token_map,
+-                    token_weights,
+-                    phase1_experts,
+-                    task_valid_rows,
+-                    expert_tile_base,
+-                    alpha,
+-                    input_global_scale,
+-                    trellis_lut,
+-                    trellis_rotations,
+-                    Int32(a_input.shape[1]) // Int32(128),
+-                    gate_tile_cnt,
+-                    Int32(b_w13.shape[0]) // Int32(256),
+-                    max_active_clusters,
+-                    stream,
+-                )
++                if cutlass.const_expr(self.p8_grouped_m32):
++                    self.materialized_phase1_kernel(
++                        packed_a_storage,
++                        scale_storage,
++                        w13_rp,
++                        w13_sfb_rp,
++                        intermediate_u32,
++                        token_map,
++                        token_weights,
++                        phase1_experts,
++                        task_valid_rows,
++                        expert_tile_base,
++                        alpha,
++                        input_global_scale,
++                        trellis_lut,
++                        expert_rate,
++                        w13_expert_base,
++                        trellis_rotations,
++                        Int32(a_input.shape[1]) // Int32(128),
++                        gate_tile_cnt,
++                        Int32(b_w13.shape[0]) // Int32(256),
++                        max_active_clusters,
++                        stream,
++                    )
++                else:
++                    self.materialized_phase1_kernel(
++                        packed_a_storage,
++                        scale_storage,
++                        w13_rp,
++                        w13_sfb_rp,
++                        intermediate_u32,
++                        token_map,
++                        token_weights,
++                        phase1_experts,
++                        task_valid_rows,
++                        expert_tile_base,
++                        alpha,
++                        input_global_scale,
++                        trellis_lut,
++                        trellis_rotations,
++                        Int32(a_input.shape[1]) // Int32(128),
++                        gate_tile_cnt,
++                        Int32(b_w13.shape[0]) // Int32(256),
++                        max_active_clusters,
++                        stream,
++                    )
+         if cutlass.const_expr(self.external_materialized_fc2):
+             if cutlass.const_expr(self.nvfp4_split_materialized):
+                 self.materialized_phase2_kernel(
+@@ -2772,25 +2800,48 @@
+                 if cutlass.const_expr(self.p8_small_m):
+                     phase2_experts = topk_ids
+                 if cutlass.const_expr(self.p8_small_m or self.p8_full_coupled):
+-                    self.materialized_phase2_kernel(
+-                        intermediate_u32,
+-                        down_rp,
+-                        down_sfb_rp,
+-                        scatter_output,
+-                        token_map,
+-                        token_weights,
+-                        phase2_experts,
+-                        task_valid_rows,
+-                        expert_tile_base,
+-                        down_alpha,
+-                        global_scale,
+-                        trellis_lut,
+-                        trellis_rotations,
+-                        gate_tile_cnt,
+-                        Int32(b_down.shape[0]) // Int32(256),
+-                        max_active_clusters,
+-                        stream,
+-                    )
++                    if cutlass.const_expr(self.p8_grouped_m32):
++                        self.materialized_phase2_kernel(
++                            intermediate_u32,
++                            down_rp,
++                            down_sfb_rp,
++                            scatter_output,
++                            token_map,
++                            token_weights,
++                            phase2_experts,
++                            task_valid_rows,
++                            expert_tile_base,
++                            down_alpha,
++                            global_scale,
++                            trellis_lut,
++                            expert_rate,
++                            w2_expert_base,
++                            trellis_rotations,
++                            gate_tile_cnt,
++                            Int32(b_down.shape[0]) // Int32(256),
++                            max_active_clusters,
++                            stream,
++                        )
++                    else:
++                        self.materialized_phase2_kernel(
++                            intermediate_u32,
++                            down_rp,
++                            down_sfb_rp,
++                            scatter_output,
++                            token_map,
++                            token_weights,
++                            phase2_experts,
++                            task_valid_rows,
++                            expert_tile_base,
++                            down_alpha,
++                            global_scale,
++                            trellis_lut,
++                            trellis_rotations,
++                            gate_tile_cnt,
++                            Int32(b_down.shape[0]) // Int32(256),
++                            max_active_clusters,
++                            stream,
++                        )
+                 else:
+                     self.materialized_phase2_kernel(
+                         intermediate_u32,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/npk_state_law.py kernel/b12x/moe/_shared/kernels/npk_state_law.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/npk_state_law.py	2026-11-11 22:30:27.685221342 -0500
++++ kernel/b12x/moe/_shared/kernels/npk_state_law.py	2026-11-13 04:13:43.039761501 -0500
+@@ -62,6 +62,10 @@
+ # E4M3 finite maximum; ``cvt.rn.satfinite`` clamps to it.
+ E4M3_MAX = 448.0
+ 
++# Fixed p25 pair bijection, frozen by pq.codec.trellis.PAIR_MIX.
++_PAIR_MIX_MULTIPLIER = 1664525
++_PAIR_MIX_OFFSET = 1013904223
++
+ 
+ # ---------------------------------------------------------------------------
+ # CPU reference law
+@@ -249,6 +253,80 @@
+ # ---------------------------------------------------------------------------
+ 
+ 
++@dsl_user_op
++def packed_decode_npk_pair_to_e4m3x8(win, *, loc=None, ip=None):
++    """Decode one 31-bit pair-rate window to two packed E4M3x4 words.
++
++    ``win`` ends at the lane's final state. Its four states are five bits
++    apart. Each state and its fixed bijective mix produce one consecutive
++    operand pair.
++    """
++
++    multiplier = f"{_TRELLIS_MCG:#010x}"
++    mask = f"{_TRELLIS_MASK:#010x}"
++    or_operand = f"{_TRELLIS_OR:#010x}"
++    asm = f"""
++        {{
++            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M, A, C;
++            .reg .b32 h01,h23,h45,h67;
++            .reg .b32 s0,s1,s2,s3;
++            .reg .b16 e01,e23,e45,e67;
++            mov.b32 M, {multiplier};
++            mov.b32 A, {_PAIR_MIX_MULTIPLIER};
++            mov.b32 C, {_PAIR_MIX_OFFSET};
++            and.b32 s3, $2, 0xffff;
++            shr.u32 s2, $2, 5; and.b32 s2, s2, 0xffff;
++            shr.u32 s1, $2, 10; and.b32 s1, s1, 0xffff;
++            shr.u32 s0, $2, 15; and.b32 s0, s0, 0xffff;
++            mov.b32 w0, s0;
++            mul.lo.u32 w1, s0, A; add.u32 w1, w1, C; and.b32 w1, w1, 0xffff;
++            mov.b32 w2, s1;
++            mul.lo.u32 w3, s1, A; add.u32 w3, w3, C; and.b32 w3, w3, 0xffff;
++            mov.b32 w4, s2;
++            mul.lo.u32 w5, s2, A; add.u32 w5, w5, C; and.b32 w5, w5, 0xffff;
++            mov.b32 w6, s3;
++            mul.lo.u32 w7, s3, A; add.u32 w7, w7, C; and.b32 w7, w7, 0xffff;
++            mul.lo.u32 w0, w0, M; lop3.b32 w0, w0, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w1, w1, M; lop3.b32 w1, w1, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w2, w2, M; lop3.b32 w2, w2, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w3, w3, M; lop3.b32 w3, w3, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w4, w4, M; lop3.b32 w4, w4, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w5, w5, M; lop3.b32 w5, w5, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w6, w6, M; lop3.b32 w6, w6, {mask}, {or_operand}, 0x6a;
++            mul.lo.u32 w7, w7, M; lop3.b32 w7, w7, {mask}, {or_operand}, 0x6a;
++            prmt.b32 lo, w0, w1, 0x5410; prmt.b32 hi, w0, w1, 0x7632; add.rn.f16x2 h01, lo, hi;
++            prmt.b32 lo, w2, w3, 0x5410; prmt.b32 hi, w2, w3, 0x7632; add.rn.f16x2 h23, lo, hi;
++            prmt.b32 lo, w4, w5, 0x5410; prmt.b32 hi, w4, w5, 0x7632; add.rn.f16x2 h45, lo, hi;
++            prmt.b32 lo, w6, w7, 0x5410; prmt.b32 hi, w6, w7, 0x7632; add.rn.f16x2 h67, lo, hi;
++            add.rn.f16x2 h01, h01, h01;
++            add.rn.f16x2 h23, h23, h23;
++            add.rn.f16x2 h45, h45, h45;
++            add.rn.f16x2 h67, h67, h67;
++            cvt.rn.satfinite.e4m3x2.f16x2 e01, h01;
++            cvt.rn.satfinite.e4m3x2.f16x2 e23, h23;
++            cvt.rn.satfinite.e4m3x2.f16x2 e45, h45;
++            cvt.rn.satfinite.e4m3x2.f16x2 e67, h67;
++            mov.b32 $0, {{e01, e23}};
++            mov.b32 $1, {{e45, e67}};
++        }}
++    """
++    result = llvm.inline_asm(
++        llvm.StructType.get_literal([T.i32(), T.i32()]),
++        [Uint32(win).ir_value(loc=loc, ip=ip)],
++        asm,
++        "=r,=r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++    return (
++        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
++        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
++    )
++
++
+ @cute.jit
+ def npk_funnel_windows(
+     smem_base: Int32,
+@@ -325,7 +403,45 @@
+     """One K16 window's E4M3x4 words for both n8 halves, ring extraction."""
+ 
+     win_a, win_b = npk_ring3_windows(smem_base, base_u32, ia, ib, s2, bits)
+-    return packed_decode_npk_to_e4m3x8(win_a, win_b, int(bits))
++    low, high = packed_decode_npk_to_e4m3x8(win_a, win_b, int(bits))
++    return (
++        _canonicalize_negative_zero_bytes(low),
++        _canonicalize_negative_zero_bytes(high),
++    )
++
++
++@cute.jit
++def _canonicalize_negative_zero_bytes(word: Uint32) -> Uint32:
++    """Change E4M3 byte 0x80 to positive zero without touching other signs."""
++
++    result = word
++    for shift in cutlass.range_constexpr(4):
++        byte = (result >> Uint32(shift * 8)) & Uint32(0xFF)
++        is_negative_zero = (byte == Uint32(0x80)).to(Int32)
++        clear = Uint32(is_negative_zero * Int32(0x80)) << Uint32(shift * 8)
++        result = result & (clear ^ Uint32(0xFFFFFFFF))
++    return result
++
++
++@cute.jit
++def npk_decode_pair(
++    smem_base: Int32,
++    base_u32: Int32,
++    ia: Int32,
++    ib: Int32,
++    s2: Int32,
++):
++    """One lane's eight ``p25`` operands from a two-word ring window."""
++
++    a = Uint32(ld_shared_u32(smem_base + ((base_u32 + ia) << Int32(2))))
++    b = Uint32(ld_shared_u32(smem_base + ((base_u32 + ib) << Int32(2))))
++    merged = (Int64(a) << Int64(32)) | Int64(b)
++    win = Uint32(merged >> Int64(s2))
++    low, high = packed_decode_npk_pair_to_e4m3x8(win)
++    return (
++        _canonicalize_negative_zero_bytes(low),
++        _canonicalize_negative_zero_bytes(high),
++    )
+ 
+ 
+ @cute.jit
+@@ -357,13 +473,39 @@
+     return own_lo, peer_lo, own_hi, peer_hi
+ 
+ 
++@cute.jit
++def npk_pair_words_both_p25(
++    smem_base: Int32,
++    lane: Int32,
++    base0_u32: Int32,
++    base1_u32: Int32,
++    ia: Int32,
++    ib: Int32,
++    s2: Int32,
++):
++    """Pair-rate twin of ``npk_pair_words_both`` with the same butterfly."""
++
++    e0_lo, e0_hi = npk_decode_pair(smem_base, base0_u32, ia, ib, s2)
++    e1_lo, e1_hi = npk_decode_pair(smem_base, base1_u32, ia, ib, s2)
++    c = lane & Int32(3)
++    own_lo, own_hi, send_lo, send_hi = e0_lo, e0_hi, e1_lo, e1_hi
++    if c >= Int32(2):
++        own_lo, own_hi, send_lo, send_hi = e1_lo, e1_hi, e0_lo, e0_hi
++    peer_lo = Uint32(cute.arch.shuffle_sync_bfly(send_lo, offset=2))
++    peer_hi = Uint32(cute.arch.shuffle_sync_bfly(send_hi, offset=2))
++    return own_lo, peer_lo, own_hi, peer_hi
++
++
+ __all__ = [
+     "E4M3_MAX",
+     "NPK_RATES",
++    "npk_decode_pair",
+     "npk_decode_ring3",
+     "npk_decode_states_reference",
+     "npk_funnel_windows",
+     "npk_pair_words_both",
++    "npk_pair_words_both_p25",
+     "npk_ring3_windows",
++    "packed_decode_npk_pair_to_e4m3x8",
+     "packed_decode_npk_to_e4m3x8",
+ ]
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/trellis_ring.py kernel/b12x/moe/_shared/kernels/trellis_ring.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/trellis_ring.py	2026-11-11 22:30:27.685738242 -0500
++++ kernel/b12x/moe/_shared/kernels/trellis_ring.py	2026-11-11 23:28:17.371884211 -0500
+@@ -11,11 +11,47 @@
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
++
+ import cutlass
+ import cutlass.cute as cute
+ from cutlass.cutlass_dsl import Int32
+ 
+ 
++@dataclass(frozen=True)
++class TrellisRateDescriptor:
++    """A trellis rate as symbol bits and operands emitted per symbol."""
++
++    symbol_bits: int
++    operands_per_symbol: int
++
++    @classmethod
++    def scalar(cls, bits: int) -> "TrellisRateDescriptor":
++        bits = int(bits)
++        if bits not in (2, 3, 4, 5):
++            raise ValueError(f"scalar trellis rate must be K2..K5; got K{bits}")
++        return cls(bits, 1)
++
++    @classmethod
++    def pair25(cls) -> "TrellisRateDescriptor":
++        return cls(5, 2)
++
++    @property
++    def bits_per_weight(self) -> float:
++        return self.symbol_bits / self.operands_per_symbol
++
++    @property
++    def tile_u32(self) -> int:
++        return 256 * self.symbol_bits // (32 * self.operands_per_symbol)
++
++    @property
++    def lane_bits(self) -> float:
++        return 8 * self.symbol_bits / self.operands_per_symbol
++
++
++TRELLIS_RATE_P25 = TrellisRateDescriptor.pair25()
++
++
+ @cute.jit
+ def trellis256_lane_geom_bits(
+     lane: Int32,
+@@ -43,3 +79,31 @@
+     ib = i2 - ring_u32 * (i2 >= ring_u32).to(Int32)
+     s2 = (i2 + Int32(1)) * Int32(32) - b2
+     return ia, ib, s2, i2 - i0
++
++
++@cute.jit
++def trellis128_pair_lane_geom(
++    lane: Int32,
++    pair_offset: cutlass.Constexpr[int],
++    pair_count: cutlass.Constexpr[int],
++):
++    """Ring geometry for ``pair_count`` pairs starting at ``pair_offset``.
++
++    A ``p25`` tile is a 640-bit ring of 20 uint32 words. Lane ``l`` owns
++    symbols ``4*l + pair_offset .. + pair_count - 1``. Its four 16-bit windows
++    span 31 bits, so the returned word indices and funnel shift always cover
++    the complete span, including lanes whose span wraps the ring.
++    """
++
++    if cutlass.const_expr(int(pair_count) < 1):
++        raise ValueError("a pair lane span needs at least one pair")
++    ring_u32 = Int32(20)
++    b1 = (Int32(4) * lane + Int32(pair_offset) + Int32(129)) * Int32(5)
++    b0 = b1 - Int32(16)
++    b2 = b1 + Int32((int(pair_count) - 1) * 5)
++    i0 = b0 >> Int32(5)
++    i2 = (b2 - Int32(1)) >> Int32(5)
++    ia = i0 - ring_u32 * (i0 >= ring_u32).to(Int32)
++    ib = i2 - ring_u32 * (i2 >= ring_u32).to(Int32)
++    s2 = (i2 + Int32(1)) * Int32(32) - b2
++    return ia, ib, s2
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_phase1.py kernel/b12x/moe/_shared/kernels/w4a8_phase1.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_phase1.py	2026-11-11 22:30:27.687746132 -0500
++++ kernel/b12x/moe/_shared/kernels/w4a8_phase1.py	2026-11-12 22:11:51.695823670 -0500
+@@ -55,10 +55,16 @@
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
+     _w4a8_had128_quad,
+     _w4a8_stage_trellis_b_tile,
++    _w4a8_stage_trellis_b_tile_rate,
+     _w4a8_trellis_lane_geom,
+     _w4a8_trellis_pair_words_both,
+     _w4a8_trellis_permute_k32,
+ )
++from b12x.moe._shared.kernels.trellis_ring import (
++    TRELLIS_RATE_P25,
++    TrellisRateDescriptor,
++    trellis128_pair_lane_geom,
++)
+ from b12x.moe._shared.kernels.activations import (
+     SITU,
+     SITU_DEFAULT_BETA,
+@@ -129,7 +135,7 @@
+         num_topk: int = 1,
+         activation: str = "silu",
+         swiglu_limit: float | None = None,
+-        trellis_bits: int | None = None,
++        trellis_bits: int | TrellisRateDescriptor | None = None,
+         trellis_intermediate_hadamard: bool = False,
+         trellis_direct_lut: bool = False,
+         trellis_codebook: str = LUT_E4M3,
+@@ -161,7 +167,33 @@
+         # a compact NxK64 FP4 tile. Gate and up are staged side by side.
+         self.a_payload_bytes = self.tile_m * 128
+         self.a_scale_bytes = self.tile_m * 4
+-        self.b_payload_bytes = self.tile_n * self.tile_k // 2
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = (
++                TrellisRateDescriptor.scalar(trellis_bits)
++                if trellis_bits is not None
++                else None
++            )
++        if rate is not None and rate != TRELLIS_RATE_P25 and rate.symbol_bits not in (
++            2,
++            3,
++            4,
++        ):
++            raise ValueError(
++                f"materialized FC1 trellis rate must be K2, K3, K4 or p25; got {rate}"
++            )
++        self.trellis_rate = rate
++        self.trellis_symbol_bits = 0 if rate is None else rate.symbol_bits
++        self.trellis_operands_per_symbol = (
++            1 if rate is None else rate.operands_per_symbol
++        )
++        self.trellis_tile_u32 = 0 if rate is None else rate.tile_u32
++        self.b_payload_bytes = (
++            self.tile_n * self.tile_k // 2
++            if rate is None
++            else 128 * rate.tile_u32
++        )
+         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
+         self.a_offset = 0
+         self.sfa_offset = self.a_offset + self.a_payload_bytes
+@@ -185,10 +217,8 @@
+                 f"materialized W4A8 phase 1 requires silu or situ, got {activation!r}"
+             )
+         self.is_situ = activation == SITU
+-        if trellis_bits is not None and trellis_bits not in (2, 3, 4):
+-            raise ValueError(f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}")
+         self.w4a8_trellis = trellis_bits is not None
+-        self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
++        self.trellis_bits = 0 if rate is None else rate.symbol_bits
+         if trellis_intermediate_hadamard and not self.w4a8_trellis:
+             raise ValueError("trellis_intermediate_hadamard requires trellis_bits")
+         self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
+@@ -249,6 +279,22 @@
+         the hook (``procedural_npk`` decodes in registers and lives in the P8
+         package); ``__init__`` refuses that id here.
+         """
++        if cutlass.const_expr(self.trellis_operands_per_symbol == 2):
++            from b12x.moe._shared.p8.kernels.npk_decode import (
++                w4a8_trellis_pair_words_rate_dispatch,
++            )
++
++            return w4a8_trellis_pair_words_rate_dispatch(
++                smem_base,
++                lane,
++                base0,
++                base1,
++                ia,
++                ib,
++                s2,
++                self.trellis_symbol_bits,
++                self.trellis_operands_per_symbol,
++            )
+         return _w4a8_trellis_pair_words_both(
+             smem_base,
+             lane,
+@@ -639,34 +685,60 @@
+             # and up (projection 1). B is fully scaled E4M3 after decode,
+             # so the SFB regions stay unstaged.
+             tr_n16_cnt = intermediate_tiles * Int32(8)
+-            tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
+-            tr_eu = Int64(input_k128_tiles * Int32(8)) * Int64(tr_k16_stride)
++            tile_u32 = Int32(self.trellis_tile_u32)
++            tr_k16_stride = tr_n16_cnt * tile_u32
+             tr_w13_half = Int64(w13_rp.shape[0]) >> Int64(1)
+             tr_common = (
+-                Int64(expert_idx) * tr_eu
++                Int64(expert_idx)
++                * Int64(input_k128_tiles * Int32(8))
++                * Int64(tr_k16_stride)
+                 + Int64(k64_slice * Int32(4)) * Int64(tr_k16_stride)
+-                + Int64(output_tile * Int32(8)) * Int64(8 * self.trellis_bits)
+-            )
+-            _w4a8_stage_trellis_b_tile(
+-                w13_rp,
+-                gate_b_base,
+-                tr_common,
+-                tr_k16_stride,
+-                self.trellis_bits,
+-                tid,
+-                self.threads_per_cta,
+-                4,
+-            )
+-            _w4a8_stage_trellis_b_tile(
+-                w13_rp,
+-                up_b_base,
+-                tr_common + tr_w13_half,
+-                tr_k16_stride,
+-                self.trellis_bits,
+-                tid,
+-                self.threads_per_cta,
+-                4,
++                + Int64(output_tile * Int32(8)) * Int64(tile_u32)
+             )
++            if cutlass.const_expr(self.trellis_operands_per_symbol == 1):
++                _w4a8_stage_trellis_b_tile(
++                    w13_rp,
++                    gate_b_base,
++                    tr_common,
++                    tr_k16_stride,
++                    self.trellis_bits,
++                    tid,
++                    self.threads_per_cta,
++                    4,
++                )
++                _w4a8_stage_trellis_b_tile(
++                    w13_rp,
++                    up_b_base,
++                    tr_common + tr_w13_half,
++                    tr_k16_stride,
++                    self.trellis_bits,
++                    tid,
++                    self.threads_per_cta,
++                    4,
++                )
++            else:
++                _w4a8_stage_trellis_b_tile_rate(
++                    w13_rp,
++                    gate_b_base,
++                    tr_common,
++                    tr_k16_stride,
++                    self.trellis_symbol_bits,
++                    self.trellis_operands_per_symbol,
++                    tid,
++                    self.threads_per_cta,
++                    4,
++                )
++                _w4a8_stage_trellis_b_tile_rate(
++                    w13_rp,
++                    up_b_base,
++                    tr_common + tr_w13_half,
++                    tr_k16_stride,
++                    self.trellis_symbol_bits,
++                    self.trellis_operands_per_symbol,
++                    tid,
++                    self.threads_per_cta,
++                    4,
++                )
+             if cutlass.const_expr(self.trellis_scaled):
+                 # The released payload carries one UE8M0 word per K32 of each
+                 # N16 window; stage both projections' scale words.
+@@ -838,7 +910,12 @@
+         q = lane >> Int32(2)
+         c = lane & Int32(3)
+         if cutlass.const_expr(self.w4a8_trellis):
+-            tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, self.trellis_bits)
++            if cutlass.const_expr(self.trellis_operands_per_symbol == 2):
++                tr_ia, tr_ib, tr_s2 = trellis128_pair_lane_geom(lane, 0, 4)
++            else:
++                tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
++                    lane, self.trellis_bits
++                )
+             trellis_lut_addr = Int64(smem_base + Int32(self.trellis_lut_offset))
+             if cutlass.const_expr(self.trellis_direct_lut):
+                 trellis_lut_addr = trellis_lut.iterator.toint()
+@@ -1022,12 +1099,14 @@
+                 if cutlass.const_expr(self.w4a8_trellis):
+                     for th in cutlass.range_constexpr(2):
+                         tr_n16 = warp_idx * Int32(2) + Int32(th)
+-                        tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(8 * self.trellis_bits)
++                        tr_b0 = (
++                            Int32(kb * 16) + tr_n16
++                        ) * Int32(self.trellis_tile_u32)
+                         g_lo0, g_lo1, g_hi0, g_hi1 = self._trellis_pair_words(
+                             gate_b_base,
+                             lane,
+                             tr_b0,
+-                            tr_b0 + Int32(64 * self.trellis_bits),
++                            tr_b0 + Int32(8 * self.trellis_tile_u32),
+                             tr_ia,
+                             tr_ib,
+                             tr_s2,
+@@ -1041,7 +1120,7 @@
+                             up_b_base,
+                             lane,
+                             tr_b0,
+-                            tr_b0 + Int32(64 * self.trellis_bits),
++                            tr_b0 + Int32(8 * self.trellis_tile_u32),
+                             tr_ia,
+                             tr_ib,
+                             tr_s2,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_phase2.py kernel/b12x/moe/_shared/kernels/w4a8_phase2.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_phase2.py	2026-11-11 22:30:27.687787756 -0500
++++ kernel/b12x/moe/_shared/kernels/w4a8_phase2.py	2026-11-21 22:07:48.811246673 -0500
+@@ -36,9 +36,16 @@
+ from b12x._lib.intrinsics.atomics import st_shared_u32
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
+     _w4a8_stage_trellis_b_tile,
++    _w4a8_stage_trellis_b_tile_per_expert,
++    _w4a8_stage_trellis_b_tile_rate,
+     _w4a8_trellis_lane_geom,
+     _w4a8_trellis_pair_words_both,
+ )
++from b12x.moe._shared.kernels.trellis_ring import (
++    TRELLIS_RATE_P25,
++    TrellisRateDescriptor,
++    trellis128_pair_lane_geom,
++)
+ from b12x.moe._shared.trellis_codebooks import (
+     LUT_E4M3,
+     PROCEDURAL_NPK,
+@@ -92,7 +99,7 @@
+         *,
+         source_tile_m: int = 128,
+         deterministic_output: bool = False,
+-        trellis_bits: int | None = None,
++        trellis_bits: int | TrellisRateDescriptor | None = None,
+         trellis_direct_lut: bool = False,
+         trellis_codebook: str = LUT_E4M3,
+         trellis_scaled: bool = False,
+@@ -133,7 +140,33 @@
+         self.a_stage_bytes = self.a_payload_bytes + self.a_scale_bytes
+         self.a_storage_bytes = self.stages * self.a_stage_bytes
+         self.b_storage_offset = ((self.a_storage_bytes + 1023) // 1024) * 1024
+-        self.b_stage_bytes = self.tile_n * self.tile_k // 2
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = (
++                TrellisRateDescriptor.scalar(trellis_bits)
++                if trellis_bits is not None
++                else None
++            )
++        if rate is not None and rate != TRELLIS_RATE_P25 and rate.symbol_bits not in (
++            2,
++            3,
++            4,
++        ):
++            raise ValueError(
++                f"materialized FC2 trellis rate must be K2, K3, K4 or p25; got {rate}"
++            )
++        self.trellis_rate = rate
++        self.trellis_symbol_bits = 0 if rate is None else rate.symbol_bits
++        self.trellis_operands_per_symbol = (
++            1 if rate is None else rate.operands_per_symbol
++        )
++        self.trellis_tile_u32 = 0 if rate is None else rate.tile_u32
++        self.b_stage_bytes = (
++            self.tile_n * self.tile_k // 2
++            if rate is None
++            else 256 * rate.tile_u32
++        )
+         self.b_storage_bytes = self.stages * self.b_stage_bytes
+         self.sfb_storage_offset = self.b_storage_offset + self.b_storage_bytes
+         self.sfb_stage_bytes = (self.tile_n // 8) * 8 * 4
+@@ -144,11 +177,9 @@
+             1 if self.direct_routes else self.source_tile_m // self.tile_m
+         )
+         self.deterministic_output = bool(deterministic_output)
+-        if trellis_bits is not None and trellis_bits not in (2, 3, 4):
+-            raise ValueError(f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}")
+         self.w4a8_trellis = trellis_bits is not None
+         self.transpose_direct = self.direct_routes and not self.w4a8_trellis
+-        self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
++        self.trellis_bits = 0 if rate is None else rate.symbol_bits
+         # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
+         # global table instead of reading a 4 KiB shared value table; the
+         # shared region is then not allocated.
+@@ -208,6 +239,22 @@
+         the hook (``procedural_npk`` decodes in registers and lives in the P8
+         package); ``__init__`` refuses that id here.
+         """
++        if cutlass.const_expr(self.trellis_operands_per_symbol == 2):
++            from b12x.moe._shared.p8.kernels.npk_decode import (
++                w4a8_trellis_pair_words_rate_dispatch,
++            )
++
++            return w4a8_trellis_pair_words_rate_dispatch(
++                smem_base,
++                lane,
++                base0,
++                base1,
++                ia,
++                ib,
++                s2,
++                self.trellis_symbol_bits,
++                self.trellis_operands_per_symbol,
++            )
+         return _w4a8_trellis_pair_words_both(
+             smem_base,
+             lane,
+@@ -402,6 +449,8 @@
+         intermediate_tiles: Int32,
+         packed_output_tiles: Int32,
+         valid_rows: Int32,
++        expert_rate: cute.Tensor | None = None,
++        expert_base: cute.Tensor | None = None,
+     ):
+         stage_enabled = cutlass.Boolean(True)
+         if cutlass.const_expr(self.fused_groups > 1):
+@@ -574,23 +623,67 @@
+                 # eight K16 rows for this N128 output tile. SFB stays unstaged
+                 # unless the arm reads the released scale plane.
+                 tr_n16_cnt = packed_output_tiles * Int32(16)
+-                tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
+-                tr_eu = Int64(intermediate_tiles * Int32(8)) * Int64(tr_k16_stride)
+-                tr_base = (
+-                    Int64(expert_idx) * tr_eu
+-                    + Int64(intermediate_slice * Int32(8)) * Int64(tr_k16_stride)
+-                    + Int64(output_tile * Int32(8)) * Int64(8 * self.trellis_bits)
+-                )
+-                _w4a8_stage_trellis_b_tile(
+-                    down_rp,
+-                    b_base,
+-                    tr_base,
+-                    tr_k16_stride,
+-                    self.trellis_bits,
+-                    tid,
+-                    self.threads_per_cta,
+-                    8,
+-                )
++                tile_u32 = Int32(self.trellis_tile_u32)
++                if cutlass.const_expr(getattr(self, "per_expert_rates", False)):
++                    rate_code = expert_rate[expert_idx].to(Int32)
++                    tile_u32 = Int32(24)
++                    if rate_code == Int32(0):
++                        tile_u32 = Int32(16)
++                    elif rate_code == Int32(1):
++                        tile_u32 = Int32(20)
++                    elif rate_code == Int32(3):
++                        tile_u32 = Int32(32)
++                    tr_k16_stride = tr_n16_cnt * tile_u32
++                    tr_base = (
++                        Int64(expert_base[expert_idx])
++                        + Int64(intermediate_slice * Int32(8)) * Int64(tr_k16_stride)
++                        + Int64(output_tile * Int32(8)) * Int64(tile_u32)
++                    )
++                    _w4a8_stage_trellis_b_tile_per_expert(
++                        down_rp,
++                        b_base,
++                        tr_base,
++                        tr_k16_stride,
++                        self.trellis_tile_u32,
++                        tile_u32,
++                        tid,
++                        self.threads_per_cta,
++                        8,
++                    )
++                else:
++                    tile_u32 = Int32(self.trellis_tile_u32)
++                    tr_k16_stride = tr_n16_cnt * tile_u32
++                    tr_eu = (
++                        Int64(intermediate_tiles * Int32(8)) * Int64(tr_k16_stride)
++                    )
++                    tr_base = (
++                        Int64(expert_idx) * tr_eu
++                        + Int64(intermediate_slice * Int32(8)) * Int64(tr_k16_stride)
++                        + Int64(output_tile * Int32(8)) * Int64(tile_u32)
++                    )
++                    if cutlass.const_expr(self.trellis_operands_per_symbol == 1):
++                        _w4a8_stage_trellis_b_tile(
++                            down_rp,
++                            b_base,
++                            tr_base,
++                            tr_k16_stride,
++                            self.trellis_bits,
++                            tid,
++                            self.threads_per_cta,
++                            8,
++                        )
++                    else:
++                        _w4a8_stage_trellis_b_tile_rate(
++                            down_rp,
++                            b_base,
++                            tr_base,
++                            tr_k16_stride,
++                            self.trellis_symbol_bits,
++                            self.trellis_operands_per_symbol,
++                            tid,
++                            self.threads_per_cta,
++                            8,
++                        )
+                 if cutlass.const_expr(self.trellis_scaled):
+                     # The released payload carries one UE8M0 word per K32 of
+                     # each N16 window; stage this N128 tile's 16 windows.
+@@ -720,7 +813,12 @@
+         q = lane >> Int32(2)
+         c = lane & Int32(3)
+         if cutlass.const_expr(self.w4a8_trellis):
+-            tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, self.trellis_bits)
++            if cutlass.const_expr(self.trellis_operands_per_symbol == 2):
++                tr_ia, tr_ib, tr_s2 = trellis128_pair_lane_geom(lane, 0, 4)
++            else:
++                tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
++                    lane, self.trellis_bits
++                )
+             trellis_lut_addr = Int64(smem_base + Int32(self.trellis_lut_offset))
+             if cutlass.const_expr(self.trellis_direct_lut):
+                 trellis_lut_addr = trellis_lut.iterator.toint()
+@@ -866,13 +964,13 @@
+                         for th in cutlass.range_constexpr(2):
+                             tr_n16 = warp_idx * Int32(2) + Int32(th)
+                             tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(
+-                                8 * self.trellis_bits
++                                self.trellis_tile_u32
+                             )
+                             d_lo0, d_lo1, d_hi0, d_hi1 = self._trellis_pair_words(
+                                 b_base,
+                                 lane,
+                                 tr_b0,
+-                                tr_b0 + Int32(64 * self.trellis_bits),
++                                tr_b0 + Int32(8 * self.trellis_tile_u32),
+                                 tr_ia,
+                                 tr_ib,
+                                 tr_s2,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_trellis_decode.py kernel/b12x/moe/_shared/kernels/w4a8_trellis_decode.py
+--- ref/b12x-trellismx/b12x/moe/_shared/kernels/w4a8_trellis_decode.py	2026-11-11 22:30:27.687813755 -0500
++++ kernel/b12x/moe/_shared/kernels/w4a8_trellis_decode.py	2026-11-21 22:06:59.720760388 -0500
+@@ -66,6 +66,88 @@
+                 )
+ 
+ 
++@cute.jit
++def _w4a8_stage_trellis_b_tile_rate(
++    tr_u32: cute.Tensor,
++    smem_base: Int32,
++    tile_base: Int64,
++    k16_stride_u32: Int32,
++    symbol_bits: cutlass.Constexpr[int],
++    operands_per_symbol: cutlass.Constexpr[int],
++    tidx: Int32,
++    tcnt: cutlass.Constexpr,
++    k16_rows: cutlass.Constexpr = 8,
++):
++    """Stage one K128xN128 trellis B tile for a two-number rate descriptor.
++
++    The staged layout is unchanged: each of the eight N16 window blocks of a
++    K16 row is ``tile_u32`` uint32 words, and rows stay ``k16_stride_u32``
++    apart.
++    """
++
++    tile_u32 = 256 * int(symbol_bits) // (32 * int(operands_per_symbol))
++    span_chunks = 2 * tile_u32
++    transfers = k16_rows * span_chunks
++    limit = Int64(tr_u32.shape[0]) - Int64(4)
++    for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
++        idx = tidx + Int32(i * tcnt)
++        if idx < Int32(transfers):
++            k16_local = idx // Int32(span_chunks)
++            chunk = idx - k16_local * Int32(span_chunks)
++            src = (
++                tile_base
++                + Int64(k16_local) * Int64(k16_stride_u32)
++                + Int64(chunk * Int32(4))
++            )
++            if src >= Int64(0) and src <= limit:
++                cp_async4_shared_global(
++                    smem_base + (idx << Int32(4)),
++                    get_ptr_as_int64(tr_u32, src),
++                )
++
++
++@cute.jit
++def _w4a8_stage_trellis_b_tile_per_expert(
++    tr_u32: cute.Tensor,
++    smem_base: Int32,
++    tile_base: Int64,
++    k16_stride_u32: Int32,
++    max_tile_u32: cutlass.Constexpr[int],
++    task_tile_u32: Int32,
++    tidx: Int32,
++    tcnt: cutlass.Constexpr,
++    k16_rows: cutlass.Constexpr = 8,
++):
++    """Stage any rate into the per-expert B staging layout.
++
++    Shared memory uses a fixed row stride of ``8 * max_tile_u32`` uint32 words
++    per K16 row. Smaller rates populate their leading ``2 * task_tile_u32``
++    16-byte chunks per row and skip the unread suffix; copies past the carrier
++    stream are predicated out.
++    """
++
++    span_chunks = 2 * int(max_tile_u32)
++    valid_chunks = Int32(2) * task_tile_u32
++    transfers = k16_rows * span_chunks
++    limit = Int64(tr_u32.shape[0]) - Int64(4)
++    for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
++        idx = tidx + Int32(i * tcnt)
++        if idx < Int32(transfers):
++            k16_local = idx // Int32(span_chunks)
++            chunk = idx - k16_local * Int32(span_chunks)
++            if chunk < valid_chunks:
++                src = (
++                    tile_base
++                    + Int64(k16_local) * Int64(k16_stride_u32)
++                    + Int64(chunk * Int32(4))
++                )
++                if src >= Int64(0) and src <= limit:
++                    cp_async4_shared_global(
++                        smem_base + (idx << Int32(4)),
++                        get_ptr_as_int64(tr_u32, src),
++                    )
++
++
+ # The native trellis B decode leaves each lane's bytes in t256 order; the
+ # MMA is exact iff the A quantizer writes this fixed within-K32 permutation
+ # (tests/moe/test_w4a8_fragment_probe.py::_NATIVE_MMA_K32_PERM). The UE8M0
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/npk_decode.py kernel/b12x/moe/_shared/p8/kernels/npk_decode.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/npk_decode.py	2026-11-11 22:30:27.688104710 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/npk_decode.py	2026-11-21 22:08:20.247198429 -0500
+@@ -16,16 +16,19 @@
+ 
+ import cutlass
+ import cutlass.cute as cute
+-from cutlass.cutlass_dsl import Int32
++from cutlass.cutlass_dsl import Int32, Uint32
+ 
+ from b12x.moe._shared.kernels.npk_state_law import (
+     npk_decode_ring3,
+     npk_pair_words_both,
++    npk_pair_words_both_p25,
+     packed_decode_npk_to_e4m3x8,
+ )
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
+     _w4a8_trellis_pair_words_both as _sqg_pair_words_both,
++    _w4a8_trellis_lane_geom,
+ )
++from b12x.moe._shared.kernels.trellis_ring import trellis128_pair_lane_geom
+ 
+ 
+ #: Name the P8 dynamic kernel and the K5 funnel kernels import.
+@@ -49,6 +52,11 @@
+ 
+ 
+ @cute.jit
++def _npk_pair_words_both_p25(smem_base, lane, base0, base1, ia, ib, s2):
++    return npk_pair_words_both_p25(smem_base, lane, base0, base1, ia, ib, s2)
++
++
++@cute.jit
+ def w4a8_trellis_pair_words_dispatch(
+     smem_base,
+     lane,
+@@ -81,7 +89,99 @@
+     )
+ 
+ 
++@cute.jit
++def w4a8_trellis_pair_words_rate_dispatch(
++    smem_base,
++    lane,
++    base0,
++    base1,
++    ia,
++    ib,
++    s2,
++    symbol_bits,
++    operands_per_symbol,
++):
++    """Dispatch the table-free decoder for scalar and pair rate descriptors."""
++
++    if cutlass.const_expr(int(operands_per_symbol) == 2):
++        return _npk_pair_words_both_p25(smem_base, lane, base0, base1, ia, ib, s2)
++    return npk_pair_words_both(smem_base, lane, base0, base1, ia, ib, s2, symbol_bits)
++
++
++@cute.jit
++def w4a8_trellis_task_lane_geom(lane, rate_code):
++    """Ring geometry for one task's runtime rate code."""
++
++    pair = trellis128_pair_lane_geom(lane, 0, 4)
++    scalar2 = _w4a8_trellis_lane_geom(lane, 2)
++    scalar3 = _w4a8_trellis_lane_geom(lane, 3)
++    scalar4 = _w4a8_trellis_lane_geom(lane, 4)
++    ia, ib, s2 = scalar3
++    if rate_code == Int32(3):
++        ia, ib, s2 = scalar4
++    if rate_code == Int32(1):
++        ia, ib, s2 = pair
++    if rate_code == Int32(0):
++        ia, ib, s2 = scalar2
++    return ia, ib, s2
++
++
++@cute.jit
++def w4a8_trellis_task_tile_u32(rate_code):
++    """The stream tile width, in uint32 words, of a runtime rate code."""
++
++    width = Int32(24)
++    if rate_code == Int32(0):
++        width = Int32(16)
++    if rate_code == Int32(1):
++        width = Int32(20)
++    if rate_code == Int32(3):
++        width = Int32(32)
++    return width
++
++
++@cute.jit
++def w4a8_trellis_task_pair_words(
++    smem_base,
++    lane,
++    base0,
++    base1,
++    ia,
++    ib,
++    s2,
++    rate_code,
++    allow_k4: cutlass.Constexpr[bool] = False,
++):
++    """Decode one K32 B pair for one task's runtime rate code."""
++
++    d0 = Uint32(0)
++    d1 = Uint32(0)
++    d2 = Uint32(0)
++    d3 = Uint32(0)
++    if rate_code == Int32(0):
++        d0, d1, d2, d3 = npk_pair_words_both(
++            smem_base, lane, base0, base1, ia, ib, s2, 2
++        )
++    elif rate_code == Int32(1):
++        d0, d1, d2, d3 = npk_pair_words_both_p25(
++            smem_base, lane, base0, base1, ia, ib, s2
++        )
++    elif rate_code == Int32(2):
++        d0, d1, d2, d3 = npk_pair_words_both(
++            smem_base, lane, base0, base1, ia, ib, s2, 3
++        )
++    else:
++        if cutlass.const_expr(allow_k4):
++            d0, d1, d2, d3 = npk_pair_words_both(
++                smem_base, lane, base0, base1, ia, ib, s2, 4
++            )
++    return d0, d1, d2, d3
++
++
+ __all__ = [
+     "packed_decode_npk_to_e4m3x8",
++    "w4a8_trellis_task_lane_geom",
++    "w4a8_trellis_task_pair_words",
++    "w4a8_trellis_pair_words_rate_dispatch",
+     "w4a8_trellis_pair_words_dispatch",
+ ]
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/p25_probe.py kernel/b12x/moe/_shared/p8/kernels/p25_probe.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/p25_probe.py	1969-12-31 19:00:00.000000000 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/p25_probe.py	2026-11-21 22:07:02.953858274 -0500
+@@ -0,0 +1,88 @@
++"""Standalone device probe for scalar and pair procedural-NPK tile decode."""
++
++from __future__ import annotations
++
++import cuda.bindings.driver as cuda
++import cutlass
++import cutlass.cute as cute
++from cutlass.cutlass_dsl import Int32
++
++from b12x._lib.intrinsics.atomics import st_shared_u32
++from b12x._lib.intrinsics.memory import shared_ptr_to_u32
++from b12x.moe._shared.kernels.npk_state_law import npk_decode_pair, npk_decode_ring3
++from b12x.moe._shared.kernels.trellis_ring import (
++    trellis128_pair_lane_geom,
++    trellis256_lane_geom_bits,
++)
++
++
++class P25TileProbeKernel:
++    """Decode every lane of each staged tile without MMA or scheduler logic."""
++
++    _RATES = {
++        "k2": (2, 1, 16),
++        "p25": (5, 2, 20),
++        "k3": (3, 1, 24),
++        "k4": (4, 1, 32),
++        "k5": (5, 1, 40),
++    }
++
++    def __init__(self, rate: str, max_tiles: int):
++        if rate not in self._RATES:
++            raise ValueError(f"probe rate must be one of {tuple(self._RATES)}")
++        self.rate = rate
++        self.symbol_bits, self.operands_per_symbol, self.ring_u32 = self._RATES[rate]
++        self.max_tiles = int(max_tiles)
++
++    @cute.jit
++    def __call__(
++        self,
++        streams: cute.Tensor,
++        output_words: cute.Tensor,
++        active_tiles: Int32,
++        stream: cuda.CUstream,
++    ):
++        self.kernel(streams, output_words, active_tiles).launch(
++            grid=(self.max_tiles, 1, 1),
++            block=(32, 1, 1),
++            stream=stream,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        streams: cute.Tensor,
++        output_words: cute.Tensor,
++        active_tiles: Int32,
++    ):
++        thread, _, _ = cute.arch.thread_idx()
++        block, _, _ = cute.arch.block_idx()
++        tile = Int32(block)
++        tid = Int32(thread)
++        if tile < active_tiles:
++            smem = cutlass.utils.SmemAllocator()
++
++            @cute.struct
++            class Storage:
++                words: cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, 40], 16]
++
++            storage = smem.allocate(Storage)
++            smem_base = shared_ptr_to_u32(storage.words.data_ptr())
++            for step in cutlass.range_constexpr((self.ring_u32 + 31) // 32):
++                word = tid + Int32(step * 32)
++                if word < Int32(self.ring_u32):
++                    st_shared_u32(smem_base + (word << Int32(2)), streams[tile, word])
++            cute.arch.sync_threads()
++            lane = tid
++            if cutlass.const_expr(self.operands_per_symbol == 2):
++                ia, ib, shift = trellis128_pair_lane_geom(lane, 0, 4)
++                low, high = npk_decode_pair(smem_base, Int32(0), ia, ib, shift)
++            else:
++                ia, ib, shift, _ = trellis256_lane_geom_bits(
++                    lane, 0, 8, self.symbol_bits
++                )
++                low, high = npk_decode_ring3(
++                    smem_base, Int32(0), ia, ib, shift, self.symbol_bits
++                )
++            output_words[tile, lane, 0] = low
++            output_words[tile, lane, 1] = high
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/p8_small_m.py kernel/b12x/moe/_shared/p8/kernels/p8_small_m.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/p8_small_m.py	2026-11-11 22:30:27.688165022 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/p8_small_m.py	2026-11-21 22:07:50.499297780 -0500
+@@ -26,7 +26,14 @@
+ from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_trellis_lane_geom
+-from b12x.moe._shared.p8.kernels.npk_decode import w4a8_trellis_pair_words_dispatch
++from b12x.moe._shared.kernels.trellis_ring import TRELLIS_RATE_P25, TrellisRateDescriptor
++from b12x.moe._shared.kernels.trellis_ring import trellis128_pair_lane_geom
++from b12x.moe._shared.p8.kernels.npk_decode import (
++    w4a8_trellis_task_lane_geom,
++    w4a8_trellis_task_pair_words,
++    w4a8_trellis_task_tile_u32,
++    w4a8_trellis_pair_words_rate_dispatch,
++)
+ 
+ from b12x.moe._shared.p8.kernels.w4a8_phase2 import (
+     P8W4A8MaterializedPhase2Kernel,
+@@ -97,15 +104,25 @@
+         *,
+         scale_sandwich: bool = False,
+         full_coupled: bool = False,
+-        trellis_bits: int = 4,
++        trellis_bits: int | TrellisRateDescriptor = 4,
+     ):
+         # The only codec toggle in this P8-only arm is the stored trellis rate.
+-        if int(trellis_bits) not in (3, 4, 5):
+-            raise ValueError("P8 small-M FC2 supports K3, K4 or K5 streams")
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = TrellisRateDescriptor.scalar(trellis_bits)
++        if rate != TRELLIS_RATE_P25 and rate.symbol_bits not in (2, 3, 4, 5):
++            raise ValueError(
++                "P8 small-M FC2 supports K2, K3, K4, K5 or p25 pair streams"
++            )
+         self.source_halves = 1
+         self.deterministic_output = True
+         self.w4a8_trellis = True
+-        self.trellis_bits = int(trellis_bits)
++        self.trellis_rate = rate
++        self.trellis_symbol_bits = rate.symbol_bits
++        self.trellis_operands_per_symbol = rate.operands_per_symbol
++        self.trellis_tile_u32 = rate.tile_u32
++        self.trellis_bits = rate.symbol_bits
+         self.trellis_direct_lut = False
+         self.trellis_codebook = "procedural_npk"
+         self.trellis_scaled = True
+@@ -117,7 +134,7 @@
+         # One staged K128xN128 trellis B tile holds 8 k16 x 8 n16 windows of
+         # 8*bits u32 words = 2048*bits bytes; the inherited class constants
+         # equal 128*128//2 only for K4.  Rescale B and everything after it.
+-        self.b_stage_bytes = 2048 * self.trellis_bits
++        self.b_stage_bytes = 256 * self.trellis_tile_u32
+         self.b_storage_bytes = 2 * self.b_stage_bytes
+         self.sfb_storage_offset = self.b_storage_offset + self.b_storage_bytes
+         self.shared_bytes = self.sfb_storage_offset + 2 * self.sfb_stage_bytes
+@@ -206,6 +223,8 @@
+         rows_capacity: Int32,
+         intermediate_tiles: Int32,
+         packed_output_tiles: Int32,
++        expert_rate: cute.Tensor | None = None,
++        expert_base: cute.Tensor | None = None,
+     ):
+         lane = tid & Int32(31)
+         q = lane >> Int32(2)
+@@ -216,7 +235,21 @@
+             self.tile_m
+         )
+         if cutlass.const_expr(self.w4a8_trellis):
+-            tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, self.trellis_bits)
++            if cutlass.const_expr(getattr(self, "per_expert_rates", False)):
++                rate_code = expert_rate[expert_idx].to(Int32)
++                task_tile_u32 = w4a8_trellis_task_tile_u32(rate_code)
++                staged_tile_u32 = task_tile_u32
++                tr_ia, tr_ib, tr_s2 = w4a8_trellis_task_lane_geom(
++                    lane, rate_code
++                )
++            elif cutlass.const_expr(self.trellis_operands_per_symbol == 2):
++                staged_tile_u32 = Int32(self.trellis_tile_u32)
++                tr_ia, tr_ib, tr_s2 = trellis128_pair_lane_geom(lane, 0, 4)
++            else:
++                staged_tile_u32 = Int32(self.trellis_tile_u32)
++                tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
++                    lane, self.trellis_bits
++                )
+             trellis_lut_addr = Int64(smem_base + Int32(self.trellis_lut_offset))
+             if cutlass.const_expr(self.trellis_direct_lut):
+                 trellis_lut_addr = trellis_lut.iterator.toint()
+@@ -236,6 +269,8 @@
+             intermediate_tiles,
+             packed_output_tiles,
+             valid_rows,
++            expert_rate,
++            expert_base,
+         )
+         cute.arch.cp_async_commit_group()
+ 
+@@ -286,6 +321,8 @@
+                     intermediate_tiles,
+                     packed_output_tiles,
+                     valid_rows,
++                    expert_rate,
++                    expert_base,
+                 )
+             cute.arch.cp_async_commit_group()
+             cute.arch.cp_async_wait_group(1)
+@@ -349,21 +386,43 @@
+                 if cutlass.const_expr(self.w4a8_trellis):
+                     for th in cutlass.range_constexpr(2):
+                         tr_n16 = warp_idx * Int32(2) + Int32(th)
+-                        tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(8 * self.trellis_bits)
+-                        d_lo0, d_lo1, d_hi0, d_hi1 = w4a8_trellis_pair_words_dispatch(
+-                            b_base,
+-                            lane,
+-                            tr_b0,
+-                            tr_b0 + Int32(64 * self.trellis_bits),
+-                            tr_ia,
+-                            tr_ib,
+-                            tr_s2,
+-                            self.trellis_bits,
+-                            trellis_lut_addr,
+-                            not self.trellis_direct_lut
+-                            and self.trellis_codebook != "procedural_npk",
+-                            self.trellis_direct_lut,
+-                        )
++                        if cutlass.const_expr(
++                            getattr(self, "per_expert_rates", False)
++                        ):
++                            row_stride_u32 = Int32(8 * self.trellis_tile_u32)
++                            tr_b0 = (
++                                Int32(kb * 2) * row_stride_u32
++                                + tr_n16 * task_tile_u32
++                            )
++                            base1 = tr_b0 + row_stride_u32
++                            d_lo0, d_lo1, d_hi0, d_hi1 = (
++                                w4a8_trellis_task_pair_words(
++                                    b_base,
++                                    lane,
++                                    tr_b0,
++                                    base1,
++                                    tr_ia,
++                                    tr_ib,
++                                    tr_s2,
++                                    rate_code,
++                                    self.trellis_tile_u32 >= 32,
++                                )
++                            )
++                        else:
++                            tr_b0 = (
++                                Int32(kb * 16) + tr_n16
++                            ) * staged_tile_u32
++                            d_lo0, d_lo1, d_hi0, d_hi1 = w4a8_trellis_pair_words_rate_dispatch(
++                                b_base,
++                                lane,
++                                tr_b0,
++                                tr_b0 + Int32(8 * self.trellis_tile_u32),
++                                tr_ia,
++                                tr_ib,
++                                tr_s2,
++                                self.trellis_symbol_bits,
++                                self.trellis_operands_per_symbol,
++                            )
+                         dn_b0[th * 2] = d_lo0
+                         dn_b1[th * 2] = d_lo1
+                         dn_b0[th * 2 + 1] = d_hi0
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/policy_m32_fc1.py kernel/b12x/moe/_shared/p8/kernels/policy_m32_fc1.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/policy_m32_fc1.py	2026-11-11 22:30:27.688211533 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/policy_m32_fc1.py	2026-11-12 22:47:03.606028304 -0500
+@@ -20,6 +20,7 @@
+ 
+ from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+ from b12x.moe._shared.p8.kernels.row_alias376_fc1 import P8H128FC1Kernel
++from b12x.moe._shared.kernels.trellis_ring import TrellisRateDescriptor
+ 
+ 
+ class P8CoupledPrefillFC1Kernel(P8H128FC1Kernel):
+@@ -31,10 +32,22 @@
+     mma_m_blocks = 2
+     owned_row_groups = 8
+ 
+-    def __init__(self, *, trellis_bits: int = 4) -> None:
+-        if int(trellis_bits) not in (3, 4, 5):
+-            raise ValueError("coupled P8 prefill FC1 supports K3, K4 or K5 streams")
+-        super().__init__(full_coupled=True, trellis_bits=int(trellis_bits))
++    def __init__(
++        self,
++        *,
++        trellis_bits: int | TrellisRateDescriptor = 4,
++        per_expert_rates: bool = False,
++    ) -> None:
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = TrellisRateDescriptor.scalar(trellis_bits)
++        if rate.symbol_bits not in (2, 3, 4, 5) and rate != TrellisRateDescriptor.pair25():
++            raise ValueError(
++                "coupled P8 FC1 supports K2, K3, K4, K5 or p25 streams"
++            )
++        super().__init__(full_coupled=True, trellis_bits=rate)
++        self.per_expert_rates = bool(per_expert_rates)
+         # GateFP16+upFP16 and transformedFP32 each occupy512 bytes/row.
+         # Their lifetimes are disjoint within a single warp-owned row.
+         self.shared_bytes = max(2 * self.stage_bytes, self.tile_m * 128 * 4)
+@@ -62,6 +75,8 @@
+         alpha: cute.Tensor,
+         input_global_scale: cute.Tensor,
+         trellis_lut: cute.Tensor,
++        expert_rate: cute.Tensor,
++        expert_base: cute.Tensor,
+         scale_component: cute.Tensor,
+         input_k128_tiles: cutlass.Int32,
+         intermediate_tiles: cutlass.Int32,
+@@ -85,6 +100,8 @@
+             alpha,
+             input_global_scale,
+             trellis_lut,
++            expert_rate,
++            expert_base,
+             scale_component,
+             input_k128_tiles,
+             intermediate_tiles,
+@@ -115,6 +132,8 @@
+         alpha: cute.Tensor,
+         input_global_scale: cute.Tensor,
+         trellis_lut: cute.Tensor,
++        expert_rate: cute.Tensor,
++        expert_base: cute.Tensor,
+         scale_component: cute.Tensor,
+         input_k128_tiles: cutlass.Int32,
+         intermediate_tiles: cutlass.Int32,
+@@ -174,6 +193,8 @@
+                     intermediate_tiles,
+                     packed_w13_tiles,
+                     Int32(0),
++                    expert_rate,
++                    expert_base,
+                 )
+             task_slot += Int32(gdimz)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/policy_m32_fc2.py kernel/b12x/moe/_shared/p8/kernels/policy_m32_fc2.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/policy_m32_fc2.py	2026-11-11 22:30:27.688185494 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/policy_m32_fc2.py	2026-11-12 22:47:18.634474732 -0500
+@@ -17,6 +17,7 @@
+ 
+ from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+ from b12x.moe._shared.p8.kernels.p8_small_m import P8SmallMPhase2Kernel
++from b12x.moe._shared.kernels.trellis_ring import TrellisRateDescriptor
+ 
+ 
+ class P8CoupledPrefillFC2Kernel(P8SmallMPhase2Kernel):
+@@ -42,12 +43,24 @@
+     shared_bytes = sfb_storage_offset + 2 * sfb_stage_bytes
+     shared_words = (shared_bytes + 3) // 4
+ 
+-    def __init__(self, *, trellis_bits: int = 4) -> None:
+-        if int(trellis_bits) not in (3, 4, 5):
+-            raise ValueError("coupled P8 prefill FC2 supports K3, K4 or K5 streams")
++    def __init__(
++        self,
++        *,
++        trellis_bits: int | TrellisRateDescriptor = 4,
++        per_expert_rates: bool = False,
++    ) -> None:
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = TrellisRateDescriptor.scalar(trellis_bits)
++        if rate.symbol_bits not in (2, 3, 4, 5) and rate != TrellisRateDescriptor.pair25():
++            raise ValueError(
++                "coupled P8 FC2 supports K2, K3, K4, K5 or p25 streams"
++            )
+         super().__init__(
+-            scale_sandwich=True, full_coupled=True, trellis_bits=int(trellis_bits)
++            scale_sandwich=True, full_coupled=True, trellis_bits=rate
+         )
++        self.per_expert_rates = bool(per_expert_rates)
+         if (self.tile_m, self.tile_n, self.source_tile_m) != (32, 128, 32):
+             raise ValueError("coupled P8 prefill FC2 requires exact M32/N128")
+         # The parent recomputes b_stage/b_storage/sfb_offset/shared from the rate using this
+@@ -69,6 +82,8 @@
+         down_alpha: cute.Tensor,
+         global_scale: cute.Tensor,
+         trellis_lut: cute.Tensor,
++        expert_rate: cute.Tensor,
++        expert_base: cute.Tensor,
+         scale_component: cute.Tensor,
+         intermediate_tiles: cutlass.Int32,
+         packed_output_tiles: cutlass.Int32,
+@@ -90,6 +105,8 @@
+             down_alpha,
+             global_scale,
+             trellis_lut,
++            expert_rate,
++            expert_base,
+             scale_component,
+             intermediate_tiles,
+             packed_output_tiles,
+@@ -115,6 +132,8 @@
+         down_alpha: cute.Tensor,
+         global_scale: cute.Tensor,
+         trellis_lut: cute.Tensor,
++        expert_rate: cute.Tensor,
++        expert_base: cute.Tensor,
+         scale_component: cute.Tensor,
+         intermediate_tiles: cutlass.Int32,
+         packed_output_tiles: cutlass.Int32,
+@@ -172,6 +191,8 @@
+                     rows_capacity,
+                     intermediate_tiles,
+                     packed_output_tiles,
++                    expert_rate,
++                    expert_base,
+                 )
+             task_slot += Int32(gdimz)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/route_hoist_dynamic.py kernel/b12x/moe/_shared/p8/kernels/route_hoist_dynamic.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/route_hoist_dynamic.py	2026-11-11 22:30:27.688043757 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/route_hoist_dynamic.py	2026-11-21 22:07:06.159955346 -0500
+@@ -219,6 +219,25 @@
+     p8_route_ids = True
+     p8_producer_split = True
+ 
++    def __init__(self, *args, trellis_rate_set: tuple[str, ...] | str = ("k4",), **kwargs):
++        from b12x.moe._shared.p8.rates import max_tile_u32, normalize_rate_set, rate_set_bits
++
++        self.trellis_rate_set = normalize_rate_set(trellis_rate_set)
++        self.p8_per_expert_rates = len(self.trellis_rate_set) > 1
++        scalar_bits = rate_set_bits(self.trellis_rate_set)
++        layout_bits = (
++            (max_tile_u32(self.trellis_rate_set) + 7) // 8
++            if scalar_bits is None
++            else scalar_bits
++        )
++        if self.trellis_rate_set == ("p25",):
++            from b12x.moe._shared.kernels.trellis_ring import TRELLIS_RATE_P25
++
++            self.trellis_layout_rate = TRELLIS_RATE_P25
++        else:
++            self.trellis_layout_rate = layout_bits
++        super().__init__(*args, trellis_bits=layout_bits, **kwargs)
++
+     @cute.jit
+     def _store_p8_m1_full_coupled_input(
+         self,
+@@ -649,7 +668,11 @@
+             source_tile_m=materialized_source_tile_m,
+             deterministic_output=bool(deterministic_output),
+             num_topk=self.num_topk,
+-            trellis_bits=(trellis_bits if self.w4a8_trellis and phase1_split else None),
++            trellis_bits=(
++                self.trellis_layout_rate
++                if self.w4a8_trellis and phase1_split
++                else None
++            ),
+             trellis_intermediate_hadamard=(
+                 self.trellis_intermediate_hadamard and phase1_split
+             ),
+@@ -666,7 +689,11 @@
+         self.materialized_phase2_kernel = P8W4A8MaterializedPhase2Kernel(
+             source_tile_m=materialized_source_tile_m,
+             deterministic_output=bool(deterministic_output),
+-            trellis_bits=(trellis_bits if self.w4a8_trellis and phase2_split else None),
++            trellis_bits=(
++                self.trellis_layout_rate
++                if self.w4a8_trellis and phase2_split
++                else None
++            ),
+             trellis_direct_lut=(self.trellis_direct_lut and phase2_split),
+             trellis_codebook=(self.trellis_codebook if phase2_split else "lut_e4m3"),
+             trellis_scaled=self.trellis_scaled and phase2_split,
+@@ -697,11 +724,13 @@
+             )
+ 
+             self.materialized_phase1_kernel = P8GroupedM16FC1Kernel(
+-                trellis_bits=trellis_bits
++                trellis_bits=self.trellis_layout_rate
+             )
+             self.materialized_phase2_kernel = P8GroupedM16FC2Kernel(
+-                trellis_bits=trellis_bits
++                trellis_bits=self.trellis_layout_rate
+             )
++            self.materialized_phase1_kernel.per_expert_rates = self.p8_per_expert_rates
++            self.materialized_phase2_kernel.per_expert_rates = self.p8_per_expert_rates
+         elif self.p8_full_coupled and self.w4a8_m64_materialized:
+             from b12x.moe._shared.p8.kernels.route_hoist_prefill import (
+                 P8CoupledPrefillFC1Kernel,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/row_alias376_fc1.py kernel/b12x/moe/_shared/p8/kernels/row_alias376_fc1.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/row_alias376_fc1.py	2026-11-11 22:30:27.688478461 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/row_alias376_fc1.py	2026-11-21 22:07:47.059193627 -0500
+@@ -49,7 +49,13 @@
+     cvt_f32x4_to_e4m3x4,
+ )
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
++from b12x.moe._shared.kernels.trellis_ring import (
++    TRELLIS_RATE_P25,
++    TrellisRateDescriptor,
++    trellis128_pair_lane_geom,
++)
+ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
++    _w4a8_stage_trellis_b_tile_per_expert,
+     _w4a8_stage_trellis_b_tile,
+     _w4a8_trellis_lane_geom,
+     _w4a8_trellis_permute_k32,
+@@ -59,7 +65,13 @@
+     SITU_DEFAULT_BETA,
+     SITU_DEFAULT_LINEAR_BETA,
+ )
+-from b12x.moe._shared.p8.kernels.npk_decode import w4a8_trellis_pair_words_dispatch
++from b12x.moe._shared.p8.kernels.npk_decode import (
++    w4a8_trellis_pair_words_dispatch,
++    w4a8_trellis_pair_words_rate_dispatch,
++    w4a8_trellis_task_lane_geom,
++    w4a8_trellis_task_pair_words,
++    w4a8_trellis_task_tile_u32,
++)
+ 
+ 
+ from b12x.moe._shared.p8.kernels.w4a8_phase1 import (
+@@ -124,17 +136,33 @@
+     owned_row_groups = 4
+     scale_sandwich = False
+     diagnostic_raw_fc1 = False
++    diagnostic_stage_trace = False
+     p8_row_interleaved = False
+ 
+-    def __init__(self, tile_n: int, *, trellis_bits: int = 4):
++    def __init__(
++        self,
++        tile_n: int,
++        *,
++        trellis_bits: int | TrellisRateDescriptor = 4,
++    ):
+         if tile_n not in (32, 64):
+             raise ValueError("P8 narrow FC1 supports N32/N64 only")
+-        if int(trellis_bits) not in (3, 4, 5):
+-            raise ValueError("P8 narrow FC1 supports K3, K4 or K5 streams")
+-        self.trellis_bits = int(trellis_bits)
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = TrellisRateDescriptor.scalar(trellis_bits)
++        if rate != TRELLIS_RATE_P25 and rate.symbol_bits not in (3, 4, 5):
++            raise ValueError(
++                "P8 direct FC1 supports K3, K4, K5 or p25 streams"
++            )
++        self.trellis_rate = rate
++        self.trellis_symbol_bits = rate.symbol_bits
++        self.trellis_operands_per_symbol = rate.operands_per_symbol
++        self.trellis_tile_u32 = rate.tile_u32
++        self.trellis_bits = rate.symbol_bits
+         # A staged N128xK64 trellis B half is 4 k16 x 8 n16 windows of 8*bits
+         # u32 words = 1024*bits bytes; the inherited constant is the K4 value.
+-        self.b_payload_bytes = 1024 * self.trellis_bits
++        self.b_payload_bytes = 128 * rate.tile_u32
+         self.owned_n = int(tile_n)
+         self.num_warps = self.owned_n // 32
+         self.threads_per_cta = self.num_warps * 32
+@@ -304,6 +332,12 @@
+         intermediate_tiles: Int32,
+         packed_w13_tiles: Int32,
+         subtile: Int32,
++        task_rate: Int32 | None = None,
++        task_tile: Int32 | None = None,
++        task_gate_base: Int32 | None = None,
++        task_up_base: Int32 | None = None,
++        task_gate_sfb_base: Int32 | None = None,
++        task_up_sfb_base: Int32 | None = None,
+     ):
+         stage = k64_slice % Int32(self.p8_pipeline_stages)
+         stage_base = smem_base + stage * Int32(self.stage_bytes)
+@@ -386,53 +420,132 @@
+             # and up (projection 1). Only the owned N64/N32 spans are copied;
+             # their original N128 shared-memory offsets remain unchanged.
+             tr_n16_cnt = intermediate_tiles * Int32(8)
+-            tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
+-            tr_eu = Int64(input_k128_tiles * Int32(8)) * Int64(tr_k16_stride)
+-            tr_w13_half = Int64(w13_rp.shape[0]) >> Int64(1)
+-            tr_common = (
+-                Int64(expert_idx) * tr_eu
+-                + Int64(k64_slice * Int32(4)) * Int64(tr_k16_stride)
+-                + Int64(output_tile * Int32(8)) * Int64(8 * self.trellis_bits)
+-            )
+-            self._stage_owned_trellis_b(
+-                w13_rp,
+-                gate_b_base,
+-                tr_common,
+-                tr_k16_stride,
+-                self.trellis_bits,
+-                tid,
+-                self.threads_per_cta,
+-                4,
+-                subtile,
+-            )
+-            self._stage_owned_trellis_b(
+-                w13_rp,
+-                up_b_base,
+-                tr_common + tr_w13_half,
+-                tr_k16_stride,
+-                self.trellis_bits,
+-                tid,
+-                self.threads_per_cta,
+-                4,
+-                subtile,
+-            )
+-            if cutlass.const_expr(self.trellis_scaled):
+-                self._stage_owned_sfb(
+-                    w13_sfb_rp,
+-                    gate_sfb_base,
+-                    Int64(gate_tile_idx) * Int64(256),
+-                    gate_packed_half,
++            if cutlass.const_expr(getattr(self, "per_expert_rates", False)):
++                rate_code = task_rate
++                task_tile_u32 = task_tile
++                tr_k16_stride = tr_n16_cnt * task_tile_u32
++                col_offset = Int64(output_tile * Int32(8)) * Int64(task_tile_u32)
++                gate_src = Int64(task_gate_base) + col_offset
++                up_src = Int64(task_up_base) + col_offset
++                _w4a8_stage_trellis_b_tile_per_expert(
++                    w13_rp,
++                    gate_b_base,
++                    gate_src,
++                    tr_k16_stride,
++                    self.trellis_tile_u32,
++                    task_tile_u32,
+                     tid,
+-                    subtile,
++                    self.threads_per_cta,
++                    4,
+                 )
+-                self._stage_owned_sfb(
+-                    w13_sfb_rp,
+-                    up_sfb_base,
+-                    Int64(up_tile) * Int64(256),
+-                    up_packed_half,
++                _w4a8_stage_trellis_b_tile_per_expert(
++                    w13_rp,
++                    up_b_base,
++                    up_src,
++                    tr_k16_stride,
++                    self.trellis_tile_u32,
++                    task_tile_u32,
+                     tid,
+-                    subtile,
++                    self.threads_per_cta,
++                    4,
+                 )
++            else:
++                tile_u32 = Int32(self.trellis_tile_u32)
++                tr_k16_stride = tr_n16_cnt * tile_u32
++                tr_eu = Int64(input_k128_tiles * Int32(8)) * Int64(tr_k16_stride)
++                tr_w13_half = Int64(w13_rp.shape[0]) >> Int64(1)
++                tr_common = (
++                    Int64(expert_idx) * tr_eu
++                    + Int64(k64_slice * Int32(4)) * Int64(tr_k16_stride)
++                    + Int64(output_tile * Int32(8)) * Int64(tile_u32)
++                )
++                if cutlass.const_expr(self.trellis_operands_per_symbol == 1):
++                    self._stage_owned_trellis_b(
++                        w13_rp,
++                        gate_b_base,
++                        tr_common,
++                        tr_k16_stride,
++                        self.trellis_bits,
++                        tid,
++                        self.threads_per_cta,
++                        4,
++                        subtile,
++                    )
++                    self._stage_owned_trellis_b(
++                        w13_rp,
++                        up_b_base,
++                        tr_common + tr_w13_half,
++                        tr_k16_stride,
++                        self.trellis_bits,
++                        tid,
++                        self.threads_per_cta,
++                        4,
++                        subtile,
++                    )
++                else:
++                    from b12x.moe._shared.kernels.w4a8_trellis_decode import (
++                        _w4a8_stage_trellis_b_tile_rate,
++                    )
++
++                    _w4a8_stage_trellis_b_tile_rate(
++                        w13_rp,
++                        gate_b_base,
++                        tr_common,
++                        tr_k16_stride,
++                        self.trellis_symbol_bits,
++                        self.trellis_operands_per_symbol,
++                        tid,
++                        self.threads_per_cta,
++                        4,
++                    )
++                    _w4a8_stage_trellis_b_tile_rate(
++                        w13_rp,
++                        up_b_base,
++                        tr_common + tr_w13_half,
++                        tr_k16_stride,
++                        self.trellis_symbol_bits,
++                        self.trellis_operands_per_symbol,
++                        tid,
++                        self.threads_per_cta,
++                        4,
++                    )
++            if cutlass.const_expr(self.trellis_scaled):
++                if cutlass.const_expr(
++                    getattr(self, "per_expert_rates", False)
++                ):
++                    self._stage_owned_sfb(
++                        w13_sfb_rp,
++                        gate_sfb_base,
++                        Int64(task_gate_sfb_base),
++                        gate_packed_half,
++                        tid,
++                        subtile,
++                    )
++                    self._stage_owned_sfb(
++                        w13_sfb_rp,
++                        up_sfb_base,
++                        Int64(task_up_sfb_base),
++                        up_packed_half,
++                        tid,
++                        subtile,
++                    )
++                else:
++                    self._stage_owned_sfb(
++                        w13_sfb_rp,
++                        gate_sfb_base,
++                        Int64(gate_tile_idx) * Int64(256),
++                        gate_packed_half,
++                        tid,
++                        subtile,
++                    )
++                    self._stage_owned_sfb(
++                        w13_sfb_rp,
++                        up_sfb_base,
++                        Int64(up_tile) * Int64(256),
++                        up_packed_half,
++                        tid,
++                        subtile,
++                    )
+ 
+     @cute.jit
+     def _activated_value(self, gate, up, alpha_value):
+@@ -477,17 +590,50 @@
+         intermediate_tiles: Int32,
+         packed_w13_tiles: Int32,
+         subtile: Int32,
++        expert_rate: cute.Tensor | None = None,
++        expert_base: cute.Tensor | None = None,
+     ):
+         warp_idx = warp_idx + subtile * Int32(self.num_warps)
+         lane = tid & Int32(31)
+         q = lane >> Int32(2)
+         c = lane & Int32(3)
++        rate_code = Int32(0)
++        task_tile_u32 = Int32(max(1, self.trellis_tile_u32))
++        task_gate_base = Int32(0)
++        task_up_base = Int32(0)
++        task_gate_sfb_base = Int32(0)
++        task_up_sfb_base = Int32(0)
+         if cutlass.const_expr(self.w4a8_trellis):
+-            tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, self.trellis_bits)
++            if cutlass.const_expr(getattr(self, "per_expert_rates", False)):
++                rate_code = expert_rate[expert_idx].to(Int32)
++                task_tile_u32 = w4a8_trellis_task_tile_u32(rate_code)
++                staged_tile_u32 = task_tile_u32
++                tr_ia, tr_ib, tr_s2 = w4a8_trellis_task_lane_geom(lane, rate_code)
++                gate_table_index = Int32(2) * expert_idx
++                task_gate_base = expert_base[gate_table_index].to(Int32)
++                task_up_base = expert_base[gate_table_index + Int32(1)].to(Int32)
++            else:
++                staged_tile_u32 = Int32(self.trellis_tile_u32)
++                tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
++                    lane, self.trellis_bits
++                )
++            tr_n16_count = intermediate_tiles * Int32(8)
++            prefetch_slice_stride = tr_n16_count * task_tile_u32
+             trellis_lut_addr = Int64(smem_base + Int32(self.trellis_lut_offset))
+             if cutlass.const_expr(self.trellis_direct_lut):
+                 trellis_lut_addr = trellis_lut.iterator.toint()
+ 
++        gate_packed_tile = (output_tile + intermediate_tiles) >> Int32(1)
++        up_packed_tile = output_tile >> Int32(1)
++        gate_sfb_tile = (
++            expert_idx * packed_w13_tiles + gate_packed_tile
++        ) * input_k128_tiles
++        up_sfb_tile = (
++            expert_idx * packed_w13_tiles + up_packed_tile
++        ) * input_k128_tiles
++        task_gate_sfb_base = gate_sfb_tile * Int32(256)
++        task_up_sfb_base = up_sfb_tile * Int32(256)
++
+         self._stage_slice(
+             packed_a_u32,
+             scale_storage,
+@@ -506,6 +652,12 @@
+             intermediate_tiles,
+             packed_w13_tiles,
+             subtile,
++            rate_code,
++            task_tile_u32,
++            task_gate_base,
++            task_up_base,
++            task_gate_sfb_base,
++            task_up_sfb_base,
+         )
+         cute.arch.cp_async_commit_group()
+ 
+@@ -522,12 +674,18 @@
+                 m_half,
+                 expert_idx,
+                 output_tile,
+-                valid_rows,
+-                Int32(1),
++            valid_rows,
++            Int32(1),
+                 input_k128_tiles,
+                 intermediate_tiles,
+                 packed_w13_tiles,
+-                subtile,
++            subtile,
++            rate_code,
++            task_tile_u32,
++            task_gate_base + Int32(4) * prefetch_slice_stride,
++            task_up_base + Int32(4) * prefetch_slice_stride,
++            task_gate_sfb_base,
++            task_up_sfb_base,
+             )
+             cute.arch.cp_async_commit_group()
+ 
+@@ -586,12 +744,49 @@
+                     intermediate_tiles,
+                     packed_w13_tiles,
+                     subtile,
++                    rate_code,
++                    task_tile_u32,
++                    task_gate_base
++                    + Int32(next_slice * Int32(4)) * prefetch_slice_stride,
++                    task_up_base
++                    + Int32(next_slice * Int32(4)) * prefetch_slice_stride,
++                    task_gate_sfb_base
++                    + Int32((next_slice >> Int32(1)) * Int32(256)),
++                    task_up_sfb_base
++                    + Int32((next_slice >> Int32(1)) * Int32(256)),
+                 )
+             cute.arch.cp_async_commit_group()
+             cute.arch.cp_async_wait_group(self.p8_pipeline_stages - 1)
+             cute.arch.fence_proxy("async.shared", space="cta")
+             cute.arch.sync_threads()
+-
++            if cutlass.const_expr(self.diagnostic_stage_trace):
++                if output_tile == Int32(0) and k64_slice < Int32(4):
++                    if tid < Int32(128):
++                        trace_base = Int32(1024) + k64_slice * Int32(256)
++                        intermediate_u32[trace_base + tid] = ld_shared_u32(
++                            gate_b_base + (tid << Int32(2))
++                        )
++                        intermediate_u32[
++                            trace_base + Int32(128) + tid
++                        ] = ld_shared_u32(up_b_base + (tid << Int32(2)))
++                    if tid < Int32(64):
++                        trace_base = Int32(2048) + k64_slice * Int32(128)
++                        intermediate_u32[trace_base + tid] = ld_shared_u32(
++                            gate_sfb_base + (tid << Int32(2))
++                        )
++                        intermediate_u32[
++                            trace_base + Int32(64) + tid
++                        ] = ld_shared_u32(up_sfb_base + (tid << Int32(2)))
++                    if tid < Int32(32):
++                        trace_base = Int32(2560) + k64_slice * Int32(36)
++                        intermediate_u32[trace_base + tid] = ld_shared_u32(
++                            a_base + (tid << Int32(2))
++                        )
++                    if tid < Int32(4):
++                        trace_base = Int32(2704) + k64_slice * Int32(4)
++                        intermediate_u32[trace_base + tid] = ld_shared_u32(
++                            sfa_base + (tid << Int32(2))
++                        )
+             scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
+             asc = cute.make_rmem_tensor((self.mma_m_blocks,), Uint32)
+             for blk in cutlass.range_constexpr(self.mma_m_blocks):
+@@ -640,39 +835,73 @@
+                     # halves of its two N16 tiles per K32 with no waste.
+                     for th in cutlass.range_constexpr(self.p8_n8_per_warp // 2):
+                         tr_n16 = warp_idx * Int32(self.p8_n8_per_warp // 2) + Int32(th)
+-                        tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(8 * self.trellis_bits)
+-                        g_lo0, g_lo1, g_hi0, g_hi1 = w4a8_trellis_pair_words_dispatch(
+-                            gate_b_base,
+-                            lane,
+-                            tr_b0,
+-                            tr_b0 + Int32(64 * self.trellis_bits),
+-                            tr_ia,
+-                            tr_ib,
+-                            tr_s2,
+-                            self.trellis_bits,
+-                            trellis_lut_addr,
+-                            not self.trellis_direct_lut
+-                            and self.trellis_codebook != "procedural_npk",
+-                            self.trellis_direct_lut,
+-                        )
++                        if cutlass.const_expr(
++                            getattr(self, "per_expert_rates", False)
++                        ):
++                            row_stride_u32 = Int32(8 * self.trellis_tile_u32)
++                            tr_b0 = (
++                                Int32(kb * 2) * row_stride_u32
++                                + tr_n16 * task_tile_u32
++                            )
++                            tr_b1 = tr_b0 + row_stride_u32
++                            g_lo0, g_lo1, g_hi0, g_hi1 = (
++                                w4a8_trellis_task_pair_words(
++                                    gate_b_base,
++                                    lane,
++                                    tr_b0,
++                                    tr_b1,
++                                    tr_ia,
++                                    tr_ib,
++                                    tr_s2,
++                                    rate_code,
++                                    self.trellis_tile_u32 >= 32,
++                                )
++                            )
++                            u_lo0, u_lo1, u_hi0, u_hi1 = (
++                                w4a8_trellis_task_pair_words(
++                                    up_b_base,
++                                    lane,
++                                    tr_b0,
++                                    tr_b1,
++                                    tr_ia,
++                                    tr_ib,
++                                    tr_s2,
++                                    rate_code,
++                                    self.trellis_tile_u32 >= 32,
++                                )
++                            )
++                        else:
++                            tr_b0 = (Int32(kb * 16) + tr_n16) * staged_tile_u32
++                            g_lo0, g_lo1, g_hi0, g_hi1 = (
++                                w4a8_trellis_pair_words_rate_dispatch(
++                                    gate_b_base,
++                                    lane,
++                                    tr_b0,
++                                    tr_b0 + Int32(8 * staged_tile_u32),
++                                    tr_ia,
++                                    tr_ib,
++                                    tr_s2,
++                                    self.trellis_symbol_bits,
++                                    self.trellis_operands_per_symbol,
++                                )
++                            )
++                            u_lo0, u_lo1, u_hi0, u_hi1 = (
++                                w4a8_trellis_pair_words_rate_dispatch(
++                                    up_b_base,
++                                    lane,
++                                    tr_b0,
++                                    tr_b0 + Int32(8 * staged_tile_u32),
++                                    tr_ia,
++                                    tr_ib,
++                                    tr_s2,
++                                    self.trellis_symbol_bits,
++                                    self.trellis_operands_per_symbol,
++                                )
++                            )
+                         gate_b0[th * 2] = g_lo0
+                         gate_b1[th * 2] = g_lo1
+                         gate_b0[th * 2 + 1] = g_hi0
+                         gate_b1[th * 2 + 1] = g_hi1
+-                        u_lo0, u_lo1, u_hi0, u_hi1 = w4a8_trellis_pair_words_dispatch(
+-                            up_b_base,
+-                            lane,
+-                            tr_b0,
+-                            tr_b0 + Int32(64 * self.trellis_bits),
+-                            tr_ia,
+-                            tr_ib,
+-                            tr_s2,
+-                            self.trellis_bits,
+-                            trellis_lut_addr,
+-                            not self.trellis_direct_lut
+-                            and self.trellis_codebook != "procedural_npk",
+-                            self.trellis_direct_lut,
+-                        )
+                         up_b0[th * 2] = u_lo0
+                         up_b1[th * 2] = u_lo1
+                         up_b0[th * 2 + 1] = u_hi0
+@@ -1455,11 +1684,24 @@
+ class P8H128FC1Kernel(P8H128NarrowFC1Kernel):
+     """One-CTA N128 owner for the H128 scale-sandwich boundary."""
+ 
+-    def __init__(self, *, full_coupled: bool = False, trellis_bits: int = 4):
+-        if int(trellis_bits) not in (3, 4, 5):
+-            raise ValueError("P8 H128 FC1 supports K3, K4 or K5 streams")
+-        self.trellis_bits = int(trellis_bits)
+-        self.b_payload_bytes = 1024 * self.trellis_bits
++    def __init__(
++        self,
++        *,
++        full_coupled: bool = False,
++        trellis_bits: int | TrellisRateDescriptor = 4,
++    ):
++        if isinstance(trellis_bits, TrellisRateDescriptor):
++            rate = trellis_bits
++        else:
++            rate = TrellisRateDescriptor.scalar(trellis_bits)
++        if rate != TRELLIS_RATE_P25 and rate.symbol_bits not in (2, 3, 4, 5):
++            raise ValueError("P8 H128 FC1 supports K2, K3, K4, K5 or p25 streams")
++        self.trellis_rate = rate
++        self.trellis_symbol_bits = rate.symbol_bits
++        self.trellis_operands_per_symbol = rate.operands_per_symbol
++        self.trellis_tile_u32 = rate.tile_u32
++        self.trellis_bits = rate.symbol_bits
++        self.b_payload_bytes = 128 * rate.tile_u32
+         self.scale_sandwich = True
+         self.full_coupled = bool(full_coupled)
+         self.owned_n = 128
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/w4a8_phase1.py kernel/b12x/moe/_shared/p8/kernels/w4a8_phase1.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/w4a8_phase1.py	2026-11-11 22:30:27.688504211 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/w4a8_phase1.py	2026-11-12 22:12:41.500353788 -0500
+@@ -12,7 +12,9 @@
+ from b12x.moe._shared.kernels.w4a8_phase1 import (
+     W4A8MaterializedPhase1Kernel as _SharedPhase1Kernel,
+ )
+-from b12x.moe._shared.p8.kernels.npk_decode import w4a8_trellis_pair_words_dispatch
++from b12x.moe._shared.p8.kernels.npk_decode import (
++    w4a8_trellis_pair_words_rate_dispatch,
++)
+ 
+ 
+ class P8W4A8MaterializedPhase1Kernel(_SharedPhase1Kernel):
+@@ -24,7 +26,7 @@
+ 
+     @cute.jit
+     def _trellis_pair_words(self, smem_base, lane, base0, base1, ia, ib, s2, lut_addr):
+-        return w4a8_trellis_pair_words_dispatch(
++        return w4a8_trellis_pair_words_rate_dispatch(
+             smem_base,
+             lane,
+             base0,
+@@ -32,8 +34,6 @@
+             ia,
+             ib,
+             s2,
+-            self.trellis_bits,
+-            lut_addr,
+-            self.w4a8_trellis_lut,
+-            self.trellis_direct_lut,
++            self.trellis_symbol_bits,
++            self.trellis_operands_per_symbol,
+         )
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/w4a8_phase2.py kernel/b12x/moe/_shared/p8/kernels/w4a8_phase2.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/kernels/w4a8_phase2.py	2026-11-11 22:30:27.688518883 -0500
++++ kernel/b12x/moe/_shared/p8/kernels/w4a8_phase2.py	2026-11-12 22:12:41.571610609 -0500
+@@ -12,7 +12,9 @@
+ from b12x.moe._shared.kernels.w4a8_phase2 import (
+     W4A8MaterializedPhase2Kernel as _SharedPhase2Kernel,
+ )
+-from b12x.moe._shared.p8.kernels.npk_decode import w4a8_trellis_pair_words_dispatch
++from b12x.moe._shared.p8.kernels.npk_decode import (
++    w4a8_trellis_pair_words_rate_dispatch,
++)
+ 
+ 
+ class P8W4A8MaterializedPhase2Kernel(_SharedPhase2Kernel):
+@@ -20,7 +22,7 @@
+ 
+     @cute.jit
+     def _trellis_pair_words(self, smem_base, lane, base0, base1, ia, ib, s2, lut_addr):
+-        return w4a8_trellis_pair_words_dispatch(
++        return w4a8_trellis_pair_words_rate_dispatch(
+             smem_base,
+             lane,
+             base0,
+@@ -28,8 +30,6 @@
+             ia,
+             ib,
+             s2,
+-            self.trellis_bits,
+-            lut_addr,
+-            self.w4a8_trellis_lut,
+-            self.trellis_direct_lut,
++            self.trellis_symbol_bits,
++            self.trellis_operands_per_symbol,
+         )
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/options.py kernel/b12x/moe/_shared/p8/options.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/options.py	2026-11-11 22:30:27.688559265 -0500
++++ kernel/b12x/moe/_shared/p8/options.py	2026-11-12 22:10:47.215351740 -0500
+@@ -71,6 +71,8 @@
+     #: ``GLM53_P8_FC1_BROADCAST_A`` when not passed).
+     fc1_broadcast_a: bool = True
+     force_materialized: bool | None = None
++    #: Pinned grouped-owner tile M; zero keeps the row-count tile policy.
++    grouped_tile_m: int = 0
+     #: A pinned resident-grid cap; wins over the raced configuration's ``mac``.
+     mac_override: int | None = None
+     deterministic_output: bool = True
+@@ -111,6 +113,11 @@
+                 f"down_remainder_phases must be one of {_PHASES}; "
+                 f"got {self.down_remainder_phases!r}"
+             )
++        if self.grouped_tile_m not in (0, 32, 64):
++            raise ValueError(
++                f"grouped_tile_m must be one of (0, 32, 64); "
++                f"got {self.grouped_tile_m!r}"
++            )
+ 
+     def as_dict(self) -> dict[str, object]:
+         return {spec.name: getattr(self, spec.name) for spec in fields(self)}
+@@ -118,3 +125,10 @@
+ 
+ #: The GLM-5.3 Flash serving configuration.
+ GLM53_SERVING_OPTIONS = P8RuntimeOptions()
++
++#: The grouped-owner configuration that serves every row count with per-expert rates.
++PER_EXPERT_TEST_OPTIONS = P8RuntimeOptions(
++    small_m_scheduler=False,
++    force_materialized=True,
++    grouped_tile_m=32,
++)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/p8_native_kernel.py kernel/b12x/moe/_shared/p8/p8_native_kernel.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/p8_native_kernel.py	2026-11-11 22:30:27.688673610 -0500
++++ kernel/b12x/moe/_shared/p8/p8_native_kernel.py	2026-11-21 22:09:06.885610465 -0500
+@@ -38,6 +38,15 @@
+     p8_scratch_layout_for,
+     select_arm as _select_arm,
+ )
++from .rates import (
++    PAIR_MIX_INCREMENT,
++    PAIR_MIX_MULTIPLIER,
++    PER_EXPERT_SCHEMA,
++    RATE_CODE,
++    RATE_TILE_U32,
++    max_tile_u32,
++    normalize_rate_set,
++)
+ from .p8_coupled_scales import (
+     COUPLED_SCHEMA as P8_COUPLED_SCHEMA,
+     SCALE_NAMES,
+@@ -107,7 +116,7 @@
+ 
+ @dataclass(frozen=True)
+ class _CompiledPrograms:
+-    arms: tuple[tuple[tuple[bool, bool, int, int, int, int], _CompiledArm], ...]
++    arms: tuple[tuple[tuple, _CompiledArm], ...]
+     reducer: object
+ 
+ 
+@@ -116,11 +125,11 @@
+ 
+ 
+ def _build_arm(
+-    spec: P8ProgramSpec, key: tuple[bool, bool, int, int, int, int]
++    spec: P8ProgramSpec, key: tuple
+ ) -> _CompiledArm:
+     """Compile (or, while b12x plans compilations, describe) one arm."""
+ 
+-    materialized, small_m, tile_m, rp2_stride, _, _ = key
++    _, materialized, small_m, tile_m, rp2_stride, _, _ = key
+     mac = (
+         spec.mac_override
+         if spec.mac_override is not None
+@@ -133,7 +142,7 @@
+         quant_recipe="w4a8_trellis",
+         w4a8_repacked=True,
+         num_topk=spec.topk,
+-        trellis_bits=spec.trellis_bits,
++        trellis_rate_set=spec.rate_set,
+         trellis_codebook="procedural_npk",
+         trellis_scaled=True,
+         trellis_identity_boundary=not spec.full_coupled,
+@@ -298,6 +307,9 @@
+         current_cuda_stream(),
+         fake_ptr_u8(),
+         ptr(cutlass.Float16, 16),
++            expert_rate_ptr=ptr(cutlass.Int32, 4, 4),
++            w13_expert_base_ptr=ptr(cutlass.Int32, 4, 4),
++            w2_expert_base_ptr=ptr(cutlass.Int32, 4, 4),
+         # The compile spec is the JIT cache key and includes every specialized
+         # field, especially stored rate, topology and epilogue dimensions. It
+         # carries no tensor-parallel rank: no arm kernel receives one, so the
+@@ -309,10 +321,11 @@
+             ("requested_m_regime_direct_policy", 1),
+             ("fc1_route_hoist", 1),
+             ("tile_m", tile_m),
+-            ("trellis_bits", spec.trellis_bits),
+-            ("npk_k5_funnel", int(small_m and spec.trellis_bits == 5)),
++            ("rate_set", ",".join(spec.rate_set)),
++            ("expert_rate_tables", 3),
++            ("npk_k5_funnel", int(small_m and spec.rate_set == ("k5",))),
+             ("fc2_carveout100_grid564", int(small_m)),
+-            ("fc2_k5_funnel", int(small_m and spec.trellis_bits == 5)),
++            ("fc2_k5_funnel", int(small_m and spec.rate_set == ("k5",))),
+             ("grouped_fc2_grid376", int(not small_m)),
+             ("tile_major_tasks", int(spec.tile_major_tasks and small_m)),
+             ("fc1_pipeline_stages", spec.fc1_pipeline_stages if small_m else 2),
+@@ -517,7 +530,12 @@
+         fc1_warp_quant = options.fc1_warp_quant
+         fc1_exact_staging = options.fc1_exact_staging
+         fc1_broadcast_a = options.fc1_broadcast_a
+-        self.device = torch.device(device)
++        requested_device = torch.device(device)
++        self.device = (
++            torch.device("cuda", torch.cuda.current_device())
++            if requested_device.type == "cuda" and requested_device.index is None
++            else requested_device
++        )
+         # D-x2: captured once; joins the compile spec below.
+         self.p8_down_remainder = options.down_remainder == "dx2"
+         self._dx2_planes = 2 if self.p8_down_remainder else 1
+@@ -551,6 +569,7 @@
+         self.tile_major_tasks = bool(tile_major_tasks)
+         self.fc1_exact_staging = bool(fc1_exact_staging)
+         self.fc1_broadcast_a = bool(fc1_broadcast_a)
++        self.grouped_tile_m = int(options.grouped_tile_m)
+         self.fc1_a_swizzle_rotate = bool(fc1_a_swizzle_rotate)
+         self.fc1_warp_quant = bool(fc1_warp_quant)
+         self.grid_policy = bool(grid_policy)
+@@ -617,28 +636,54 @@
+             metadata = src.metadata() or {}
+             schema = metadata.get("schema")
+             source_design_sha256 = metadata.get("source_design_sha256")
++            per_expert_schema = schema == PER_EXPERT_SCHEMA
+             bits_text = metadata.get("bits", "")
+-            if bits_text not in {"3", "4", "5"}:
+-                raise RuntimeError(f"invalid P8 trellis rate: {bits_text!r}")
+-            self.trellis_bits = int(bits_text)
+-            base_required = {
+-                "layer": str(self.layer),
+-                "rank": str(self.tp_rank),
+-                "world_size": str(self.world_size),
+-                "bits": bits_text,
+-                "alphabet": "e4m3",
+-                "scale": "ue8m0-k32",
+-                "law": "procedural-mcg-alpha2",
+-                "ldlq": "false",
+-            }
++            if per_expert_schema:
++                declared_rate_set = normalize_rate_set(
++                    metadata.get("rate_set", "")
++                )
++                if not (
++                    len(declared_rate_set) >= 2
++                    and set(declared_rate_set) <= {"k2", "p25", "k3", "k4"}
++                ):
++                    raise RuntimeError(
++                        f"unsupported per-expert P8 rate_set: {metadata.get('rate_set')!r}"
++                    )
++                self.trellis_bits = (max_tile_u32(declared_rate_set) + 7) // 8
++                base_required = {
++                    "layer": str(self.layer),
++                    "rank": str(self.tp_rank),
++                    "world_size": str(self.world_size),
++                    "alphabet": "e4m3",
++                    "scale": "ue8m0-k32",
++                    "law": "procedural-mcg-alpha2",
++                    "ldlq": "false",
++                    "pair_mix_multiplier": str(PAIR_MIX_MULTIPLIER),
++                    "pair_mix_increment": str(PAIR_MIX_INCREMENT),
++                }
++            else:
++                if bits_text not in {"2", "3", "4", "5"}:
++                    raise RuntimeError(f"invalid P8 trellis rate: {bits_text!r}")
++                self.trellis_bits = int(bits_text)
++                base_required = {
++                    "layer": str(self.layer),
++                    "rank": str(self.tp_rank),
++                    "world_size": str(self.world_size),
++                    "bits": bits_text,
++                    "alphabet": "e4m3",
++                    "scale": "ue8m0-k32",
++                    "law": "procedural-mcg-alpha2",
++                    "ldlq": "false",
++                }
+             identity_schema = schema in {
+                 "glm53-p8-identity-mcg-tp4-rank.v1",
+                 "glm53-p8-mcg-tp4-rank.v2",
+             }
+             scale_component_schema = schema == P8_SCALE_COMPONENT_SCHEMA
+-            full_coupled_schema = schema == P8_COUPLED_SCHEMA.replace(
+-                "tp4", f"tp{self.world_size}"
+-            )
++            full_coupled_schema = schema in {
++                P8_COUPLED_SCHEMA.replace("tp4", f"tp{self.world_size}"),
++                PER_EXPERT_SCHEMA,
++            }
+             if self.world_size == 2 and not full_coupled_schema:
+                 raise RuntimeError("TP2 port only supports the full-coupled schema")
+             if (
+@@ -671,8 +716,14 @@
+                 raise RuntimeError(
+                     "historical P8 sidecars cannot satisfy a v2 design pin"
+                 )
+-            w13 = src.get_tensor("w13_trellis")
+-            w2 = src.get_tensor("w2_trellis")
++            if per_expert_schema:
++                expert_rate_u8 = src.get_tensor("expert_rate_u8")
++                expert_slot_u16 = src.get_tensor("expert_slot_u16")
++                w13 = None
++                w2 = None
++            else:
++                w13 = src.get_tensor("w13_trellis")
++                w2 = src.get_tensor("w2_trellis")
+             w13_scale = src.get_tensor("w13_scale_ue8m0")
+             w2_scale = src.get_tensor("w2_scale_ue8m0")
+             scale_tensors = (
+@@ -681,18 +732,82 @@
+                 else None
+             )
+         self.source_design_sha256 = source_design_sha256
+-        experts = int(w13.shape[1])
+-        stream_words = 16 * self.trellis_bits
+-        if tuple(w13.shape) != (
+-            2,
+-            experts,
+-            hidden // 16,
+-            intermediate // 16,
+-            stream_words,
+-        ):
+-            raise RuntimeError(f"unexpected W13 trellis shape {tuple(w13.shape)}")
+-        if tuple(w2.shape) != (experts, intermediate // 16, hidden // 16, stream_words):
+-            raise RuntimeError(f"unexpected W2 trellis shape {tuple(w2.shape)}")
++        if per_expert_schema:
++            experts = int(expert_rate_u8.shape[0])
++            counts = {
++                name: int(str(metadata.get(f"experts_{name}", "0")))
++                for name in RATE_CODE
++            }
++            if experts != 288 or sum(counts.values()) != experts:
++                raise RuntimeError(
++                    f"invalid per-expert rate counts: {counts} for {experts} experts"
++                )
++            if tuple(expert_slot_u16.shape) != (experts,):
++                raise RuntimeError("unexpected per-expert slot table shape")
++            for name in RATE_CODE:
++                expected_slot = 0
++                for expert in range(experts):
++                    if int(expert_rate_u8[expert]) != RATE_CODE[name]:
++                        continue
++                    if int(expert_slot_u16[expert]) != expected_slot:
++                        raise RuntimeError(
++                            f"per-expert {name} slots are not ascending from zero"
++                        )
++                    expected_slot += 1
++            for name, count in counts.items():
++                if count and name not in declared_rate_set:
++                    raise RuntimeError(
++                        f"per-expert {name} count is {count}, outside rate_set {declared_rate_set}"
++                    )
++                actual = int((expert_rate_u8 == RATE_CODE[name]).sum().item())
++                if actual != count:
++                    raise RuntimeError(
++                        f"per-expert {name} count is {actual}, metadata says {count}"
++                    )
++                expected_w13 = (2, count, hidden // 16, intermediate // 16, 2 * RATE_TILE_U32[name])
++                expected_w2 = (
++                    count,
++                    intermediate // 16,
++                    hidden // 16,
++                    2 * RATE_TILE_U32[name],
++                )
++                w13_bank = src.get_tensor(f"w13_trellis_{name}") if count else None
++                w2_bank = src.get_tensor(f"w2_trellis_{name}") if count else None
++                if count and tuple(w13_bank.shape) != expected_w13:
++                    raise RuntimeError(
++                        f"unexpected {name} W13 bank shape {tuple(w13_bank.shape)}"
++                    )
++                if count and tuple(w2_bank.shape) != expected_w2:
++                    raise RuntimeError(
++                        f"unexpected {name} W2 bank shape {tuple(w2_bank.shape)}"
++                    )
++                if count == 0 and (
++                    f"w13_trellis_{name}" in src.keys()
++                    or f"w2_trellis_{name}" in src.keys()
++                ):
++                    raise RuntimeError(f"empty per-expert {name} bank carries tensors")
++            self.per_expert_rates = True
++            self.rate_set = declared_rate_set
++        else:
++            experts = int(w13.shape[1])
++            stream_words = 16 * self.trellis_bits
++            if tuple(w13.shape) != (
++                2,
++                experts,
++                hidden // 16,
++                intermediate // 16,
++                stream_words,
++            ):
++                raise RuntimeError(f"unexpected W13 trellis shape {tuple(w13.shape)}")
++            if tuple(w2.shape) != (
++                experts,
++                intermediate // 16,
++                hidden // 16,
++                stream_words,
++            ):
++                raise RuntimeError(f"unexpected W2 trellis shape {tuple(w2.shape)}")
++            self.per_expert_rates = False
++            self.rate_set = (f"k{self.trellis_bits}",)
+         if tuple(w13_scale.shape) != (experts, 2 * intermediate, hidden // 32):
+             raise RuntimeError(f"unexpected W13 scale shape {tuple(w13_scale.shape)}")
+         if tuple(w2_scale.shape) != (experts, hidden, intermediate // 32):
+@@ -721,8 +836,11 @@
+                 validator_kwargs["expected_transform_sha256"] = (
+                     expected_transform_sha256
+                 )
++            component_metadata = dict(metadata)
++            if per_expert_schema:
++                component_metadata["schema"] = P8_COUPLED_SCHEMA
+             self.scale_component = validator(
+-                metadata,
++                component_metadata,
+                 scale_tensors,
+                 layer=self.layer,
+                 rank=self.tp_rank,
+@@ -731,17 +849,114 @@
+                 intermediate=intermediate,
+                 **validator_kwargs,
+             )
+-            if not self.small_m_scheduler or self.fc1_tile_n != 128:
+-                raise RuntimeError("P8 scale component requires the M1 N128 owner path")
++            grouped = (
++                not self.small_m_scheduler
++                and self.force_materialized is True
++                and self.grouped_tile_m in (32, 64)
++            )
++            if self.per_expert_rates and not grouped:
++                raise RuntimeError(
++                    "per-expert rates require the grouped owners; set "
++                    "small_m_scheduler=False, force_materialized=True and "
++                    "grouped_tile_m to 32 or 64"
++                )
++            if not self.per_expert_rates and not (
++                grouped or (self.small_m_scheduler and self.fc1_tile_n == 128)
++            ):
++                raise RuntimeError(
++                    "P8 scale component requires the grouped owners or the M1 N128 "
++                    "owner path"
++                )
+         # The trellis storage is byte-for-byte the same size as the packed
+         # E2M1 descriptor carrier expected by the inherited W4A8 launch ABI.
+         # Alias it for the descriptor-only arguments instead of allocating a
+         # second ~0.9 GiB of unread dummy weights per layer and TP rank.  The
+         # kernel reads the procedural stream through the uint32 pointers below;
+         # it never dereferences the descriptor carrier values.
+-        w13_stream_storage = w13.to(device=self.device).contiguous()
+-        w2_stream_storage = w2.to(device=self.device).contiguous()
+-        self.w13_stream = w13_stream_storage.view(torch.int32).reshape(-1)
++        if self.per_expert_rates:
++            def bank_u32(bank):
++                return bank.contiguous().view(torch.int32).reshape(-1)
++
++            w13_storage = torch.cat(
++                [
++                    bank_u32(src.get_tensor(f"w13_trellis_{name}"))
++                    for name in self.rate_set
++                    if f"w13_trellis_{name}" in src.keys()
++                ]
++            )
++            w2_storage = torch.cat(
++                [
++                    bank_u32(src.get_tensor(f"w2_trellis_{name}"))
++                    for name in self.rate_set
++                    if f"w2_trellis_{name}" in src.keys()
++                ]
++            )
++            w13_stream_storage = w13_storage.to(device=self.device)
++            w2_stream_storage = w2_storage.to(device=self.device)
++            self.w13_stream = w13_stream_storage.reshape(-1).contiguous()
++            self.w2_stream = w2_stream_storage.reshape(-1).contiguous()
++            self.expert_rate = expert_rate_u8.to(torch.int32).to(self.device)
++            self.w13_expert_base = torch.empty(
++                (2, experts), dtype=torch.int32, device=self.device
++            )
++            self.w2_expert_base = torch.empty(
++                (experts,), dtype=torch.int32, device=self.device
++            )
++            w13_bank_start = 0
++            w2_bank_start = 0
++            for name in self.rate_set:
++                count = counts[name]
++                tile = RATE_TILE_U32[name]
++                w13_half_expert = (hidden // 16) * (intermediate // 16) * tile
++                w2_expert = (intermediate // 16) * (hidden // 16) * tile
++                for expert in range(experts):
++                    if int(expert_rate_u8[expert]) != RATE_CODE[name]:
++                        continue
++                    slot = int(expert_slot_u16[expert])
++                    self.w13_expert_base[0, expert] = (
++                        w13_bank_start + slot * w13_half_expert
++                    )
++                    self.w13_expert_base[1, expert] = (
++                        w13_bank_start
++                        + count * w13_half_expert
++                        + slot * w13_half_expert
++                    )
++                    self.w2_expert_base[expert] = w2_bank_start + slot * w2_expert
++                w13_bank_start += 2 * count * w13_half_expert
++                w2_bank_start += count * w2_expert
++            self.w13_expert_base_upload = (
++                self.w13_expert_base.transpose(0, 1).reshape(-1).contiguous()
++            )
++        else:
++            w13_stream_storage = w13.to(device=self.device).contiguous()
++            w2_stream_storage = w2.to(device=self.device).contiguous()
++            self.w13_stream = w13_stream_storage.view(torch.int32).reshape(-1)
++            self.w2_stream = w2_stream_storage.view(torch.int32).reshape(-1)
++            uniform_name = f"k{self.trellis_bits}"
++            self.expert_rate = torch.full(
++                (experts,),
++                RATE_CODE[uniform_name],
++                dtype=torch.int32,
++                device=self.device,
++            )
++            uniform_tile = RATE_TILE_U32[uniform_name]
++            w13_half_expert = (hidden // 16) * (intermediate // 16) * uniform_tile
++            w13_half = experts * w13_half_expert
++            self.w13_expert_base = torch.empty(
++                (2, experts), dtype=torch.int32, device=self.device
++            )
++            self.w13_expert_base[0] = (
++                torch.arange(experts, device=self.device, dtype=torch.int32)
++                * w13_half_expert
++            )
++            self.w13_expert_base[1] = self.w13_expert_base[0] + w13_half
++            self.w13_expert_base_upload = (
++                self.w13_expert_base.transpose(0, 1).reshape(-1).contiguous()
++            )
++            self.w2_expert_base = (
++                torch.arange(experts, device=self.device, dtype=torch.int32)
++                * ((intermediate // 16) * (hidden // 16) * uniform_tile)
++            )
+         if self.fc1_exact_staging:
+             if (
+                 self.world_size,
+@@ -753,7 +968,18 @@
+                 raise ValueError(
+                     "exact staging requires full-coupled TP4 E288/H4096/I512 N128"
+                 )
+-            expected_words = 2 * 288 * 4096 * 512 * self.trellis_bits // 32
++            expected_words = (
++                sum(
++                    counts[name]
++                    * 2
++                    * (hidden // 16)
++                    * (intermediate // 16)
++                    * RATE_TILE_U32[name]
++                    for name in self.rate_set
++                )
++                if self.per_expert_rates
++                else 2 * experts * hidden * intermediate * self.trellis_bits // 32
++            )
+             if self.w13_stream.numel() != expected_words:
+                 raise ValueError("exact staging FC1 stream extent mismatch")
+         self.w2_stream = w2_stream_storage.view(torch.int32).reshape(-1)
+@@ -791,17 +1017,17 @@
+         # the PACKED row length, which is bits/8 bytes per weight: hidden // 2
+         # only at K4.  Deriving it from the stored rate keeps K4 byte-identical
+         # while letting K3 and K5 describe their own shorter or longer rows.
+-        w13_row_bytes = hidden * self.trellis_bits // 8
+-        w2_row_bytes = intermediate * self.trellis_bits // 8
++        w13_row_bytes = self.w13_stream.numel() * 4 // (experts * 2 * intermediate)
++        w2_row_bytes = self.w2_stream.numel() * 4 // (experts * hidden)
+         w13_dummy_bytes = experts * 2 * intermediate * w13_row_bytes
+         w2_dummy_bytes = experts * hidden * w2_row_bytes
+         self.w13_dummy = (
+-            w13_stream_storage.view(torch.uint8)
++            self.w13_stream.view(torch.uint8)
+             .reshape(-1)[:w13_dummy_bytes]
+             .reshape(experts, 2 * intermediate, w13_row_bytes)
+         )
+         self.w2_dummy = (
+-            w2_stream_storage.view(torch.uint8)
++            self.w2_stream.view(torch.uint8)
+             .reshape(-1)[:w2_dummy_bytes]
+             .reshape(experts, hidden, w2_row_bytes)
+         )
+@@ -825,7 +1051,7 @@
+         # programs. Grouped work is never replayed row by row through the M1
+         # kernel, and a non-K4 layer takes the same native path as K4 (see
+         # ``__call__``).
+-        self._compiled: dict[tuple[bool, bool, int, int, int, int], _CompiledArm] = {}
++        self._compiled: dict[tuple, _CompiledArm] = {}
+         self._coupled_reducer = None
+         # Every setting that selects or specializes a launched program, as the
+         # metadata a compile job carries: a change to any field is a different
+@@ -835,7 +1061,7 @@
+         # it selects and verifies this rank's sidecar slice, and no launched
+         # kernel receives it (see ``P8ProgramSpec``).
+         self.program_spec = P8ProgramSpec(
+-            trellis_bits=self.trellis_bits,
++            rate_set=self.rate_set,
+             experts=self.experts,
+             hidden=self.hidden,
+             intermediate=self.intermediate,
+@@ -859,7 +1085,7 @@
+             tile_major_tasks=self.tile_major_tasks,
+             fc1_tile_n=self.fc1_tile_n,
+             rp2_direct_tile_m=self.rp2_direct_tile_m,
+-            grouped_tile_m=0,
++            grouped_tile_m=self.grouped_tile_m,
+             rp2_stride=192,
+             fc1_warps=self.fc1_warps,
+             fc1_pipeline_stages=self.fc1_pipeline_stages,
+@@ -958,7 +1184,7 @@
+                 raise RuntimeError(f"P8 program bundle declares unknown arm {key}")
+             if key in installed:
+                 raise RuntimeError(f"P8 program bundle repeats arm {key}")
+-            if arm.tile_m != key[2] or arm.materialized != key[0]:
++            if arm.tile_m != key[3] or arm.materialized != key[1]:
+                 raise RuntimeError(f"P8 program carrier disagrees with arm {key}")
+             if not callable(arm.compiled) or not program_keys(arm):
+                 raise RuntimeError(f"P8 program carrier lacks arm {key}")
+@@ -1209,6 +1435,11 @@
+             current_cuda_stream(),
+             _gptr(cutlass.Uint8, self.zero_lut),
+             _gptr(cutlass.Float16, self.scale_component_packed),
++            expert_rate_ptr=_gptr(cutlass.Int32, self.expert_rate, 4),
++            w13_expert_base_ptr=_gptr(
++                cutlass.Int32, self.w13_expert_base_upload, 4
++            ),
++            w2_expert_base_ptr=_gptr(cutlass.Int32, self.w2_expert_base, 4),
+         )
+         if self.deterministic_output:
+             if self.full_coupled:
+@@ -1236,6 +1467,7 @@
+                 "intermediate_u32": intermediate_u32,
+                 "route_output": kernel_output,
+                 "token_map": token_map,
++                "task_expert": task_expert,
+                 "row_counts": row_counts,
+                 "expert_tile_base": expert_tile_base,
+             }
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/plan.py kernel/b12x/moe/_shared/p8/plan.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/plan.py	2026-11-11 22:30:27.688693761 -0500
++++ kernel/b12x/moe/_shared/p8/plan.py	2026-11-21 22:07:44.440114331 -0500
+@@ -12,6 +12,7 @@
+ from dataclasses import dataclass, replace
+ 
+ from .launch import P8LaunchConfig
++from .rates import max_tile_u32, normalize_rate_set, rate_set_bits
+ from .scratch import p8_launch_layout, use_small_m
+ from .tile_policy import select_tile
+ 
+@@ -45,7 +46,7 @@
+     requires every rank to declare the same race keys.
+     """
+ 
+-    trellis_bits: int
++    rate_set: tuple[str, ...]
+     experts: int
+     hidden: int
+     intermediate: int
+@@ -81,6 +82,16 @@
+     fc1_exact_staging: bool
+     fc1_broadcast_a: bool
+ 
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "rate_set", normalize_rate_set(self.rate_set))
++
++    @property
++    def trellis_bits(self) -> int:
++        """The scalar rate of a one-member scalar set, or the layout width."""
++
++        bits = rate_set_bits(self.rate_set)
++        return (max_tile_u32(self.rate_set) + 7) // 8 if bits is None else bits
++
+ 
+ def launch_spec(
+     spec: P8ProgramSpec, config: P8LaunchConfig | None = None
+@@ -101,7 +112,7 @@
+     return replace(
+         spec,
+         rp2_direct_tile_m=config.direct_tile_m,
+-        grouped_tile_m=config.grouped_tile_m,
++        grouped_tile_m=config.grouped_tile_m or spec.grouped_tile_m,
+         rp2_stride=config.rp2_stride,
+         fc1_pipeline_stages=config.fc1_pipeline_stages,
+         fc1_warps=config.fc1_warps,
+@@ -135,7 +146,7 @@
+     materialized: bool,
+     small_m: bool = False,
+     expected_m: int | None = None,
+-) -> tuple[bool, bool, int, int, int, int]:
++) -> tuple[str, bool, bool, int, int, int, int]:
+     """The identity of one compiled arm: what it is and its row geometry.
+ 
+     The direct arm is one fixed-capacity arm: every enabled call uses one
+@@ -150,6 +161,7 @@
+         raise ValueError(f"a P8 arm covers at least one row; got {selected_m}")
+     if not small_m:
+         return (
++            ",".join(spec.rate_set),
+             materialized,
+             False,
+             spec.grouped_tile_m or select_tile(selected_m)[0],
+@@ -162,6 +174,7 @@
+     # row with a residual row a constant distance away, so one compiled arm
+     # serves every enabled row count.
+     return (
++        ",".join(spec.rate_set),
+         materialized,
+         True,
+         tile_m,
+@@ -216,7 +229,7 @@
+     key = arm_key(spec, materialized, small_m, rows)
+     return p8_launch_layout(
+         tokens=rows,
+-        tile_m=key[2],
++        tile_m=key[3],
+         direct=small_m,
+         intermediate=spec.intermediate,
+         hidden=spec.hidden,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/_shared/p8/rates.py kernel/b12x/moe/_shared/p8/rates.py
+--- ref/b12x-trellismx/b12x/moe/_shared/p8/rates.py	1969-12-31 19:00:00.000000000 -0500
++++ kernel/b12x/moe/_shared/p8/rates.py	2026-11-12 22:19:42.969662198 -0500
+@@ -0,0 +1,65 @@
++"""Rate identities shared by the P8 planner, runtime and compiler."""
++
++from __future__ import annotations
++
++RATE_CODE = {"k2": 0, "p25": 1, "k3": 2, "k4": 3, "k5": 4}
++RATE_NAME = tuple(RATE_CODE)
++RATE_TILE_U32 = {"k2": 16, "p25": 20, "k3": 24, "k4": 32, "k5": 40}
++PER_EXPERT_SCHEMA = "glm53-p8-coupled-h512-h128-tp4-rank-per-expert.v1"
++PAIR_MIX_MULTIPLIER = 1664525
++PAIR_MIX_INCREMENT = 1013904223
++
++
++def normalize_rate_set(value) -> tuple[str, ...]:
++    """Validate and canonically order a P8 rate set."""
++
++    if isinstance(value, str):
++        names = value.split(",")
++    elif isinstance(value, (tuple, list)):
++        names = tuple(value)
++    else:
++        raise TypeError(f"a P8 rate set must be a string or sequence; got {value!r}")
++    if not names:
++        raise ValueError("a P8 rate set cannot be empty")
++    for name in names:
++        if not isinstance(name, str) or name not in RATE_CODE:
++            raise ValueError(
++                f"a P8 rate must be one of {list(RATE_CODE)}; got {name!r}"
++            )
++    rate_set = tuple(sorted(set(names), key=RATE_CODE.get))
++    if len(rate_set) != len(names):
++        raise ValueError(f"a P8 rate set cannot repeat a rate; got {value!r}")
++    return rate_set
++
++
++def rate_set_bits(rate_set: tuple[str, ...]) -> int | None:
++    """The scalar bit width of a one-member scalar rate set, else ``None``."""
++
++    if rate_set == ("k2",):
++        return 2
++    if rate_set == ("k3",):
++        return 3
++    if rate_set == ("k4",):
++        return 4
++    if rate_set == ("k5",):
++        return 5
++    return None
++
++
++def max_tile_u32(rate_set: tuple[str, ...]) -> int:
++    """The staging tile width every member of a rate set fits."""
++
++    return max(RATE_TILE_U32[name] for name in rate_set)
++
++
++__all__ = [
++    "PAIR_MIX_INCREMENT",
++    "PAIR_MIX_MULTIPLIER",
++    "PER_EXPERT_SCHEMA",
++    "RATE_CODE",
++    "RATE_NAME",
++    "RATE_TILE_U32",
++    "max_tile_u32",
++    "normalize_rate_set",
++    "rate_set_bits",
++]

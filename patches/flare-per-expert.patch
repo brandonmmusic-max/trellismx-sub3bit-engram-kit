@@ -1,0 +1,859 @@
+# Flare per-expert TrellisMX recipe
+# Base commit: ac5d9acc
+diff -ruN --no-dereference '--exclude=__pycache__' '--exclude=.pytest_cache' ./ignition/preparation/trellismx_release.py ./ignition/preparation/trellismx_release.py
+--- ./ignition/preparation/trellismx_release.py	2026-10-31 16:46:59.000000000 -0400
++++ ./ignition/preparation/trellismx_release.py	2026-11-12 22:50:19.960806408 -0500
+@@ -22,6 +22,8 @@
+ 
+ MANIFEST_NAME = "trellismx-manifest.json"
+ MANIFEST_SCHEMA = "trellismx.hf-overlay-release.v1"
++PER_EXPERT_MANIFEST_SCHEMA = "trellismx.hf-overlay-release.v2-per-expert"
++MANIFEST_SCHEMAS = (MANIFEST_SCHEMA, PER_EXPERT_MANIFEST_SCHEMA)
+ CARRIER_DIRECTORY = "carrier"
+ SIDECAR_DIRECTORY = "sidecars"
+ # The encoder transform the sidecars pin, which preparation reads beside them.
+@@ -34,7 +36,7 @@
+ 
+ 
+ def _manifest(root: Path) -> dict | None:
+-    """``root``'s overlay manifest when it declares this schema, else None.
++    """``root``'s overlay manifest when it declares a known schema, else None.
+ 
+     Raises ``ValueError`` when the manifest exists but is not a readable JSON object.
+     """
+@@ -47,7 +49,7 @@
+         raise ValueError(f"{manifest_path} is unreadable: {error}") from error
+     if not isinstance(manifest, dict):
+         raise ValueError(f"{manifest_path} is not a JSON object")
+-    return manifest if manifest.get("schema") == MANIFEST_SCHEMA else None
++    return manifest if manifest.get("schema") in MANIFEST_SCHEMAS else None
+ 
+ 
+ def _carrier_index(root: Path) -> Path:
+@@ -66,11 +68,16 @@
+ 
+ def overlay_schema(root: str | Path) -> str | None:
+     """The overlay manifest schema ``root`` is packaged with, or None for any other checkpoint."""
+-    return MANIFEST_SCHEMA if _manifest(Path(root).expanduser()) is not None else None
++    manifest = _manifest(Path(root).expanduser())
++    return None if manifest is None else manifest["schema"]
+ 
+ 
+ def _allocation(manifest: dict) -> dict[int, int]:
+-    """The manifest's allocation: each layer index and the tensor-parallel size it is sliced for."""
++    """The manifest's layer indices and tensor-parallel size.
++
++    A uniform release names its tensor-parallel size directly. A per-expert
++    release names three rate counts and is stored for four ranks.
++    """
+     allocation = manifest.get("allocation")
+     if not isinstance(allocation, dict) or not allocation:
+         raise ValueError("TrellisMX manifest allocation must be a nonempty object of layer indices")
+@@ -80,6 +87,8 @@
+             layer = int(key)
+         except ValueError:
+             layer = None
++        if manifest.get("schema") == PER_EXPERT_MANIFEST_SCHEMA and isinstance(world_size, dict):
++            world_size = 4
+         if layer is None or key != str(layer) or layer < 0 or type(world_size) is not int or world_size <= 0:
+             raise ValueError(f"TrellisMX manifest allocation entry {key!r}: {world_size!r} is invalid")
+         layers[layer] = world_size
+@@ -151,7 +160,34 @@
+     return carrier + sum(size for _, size in _manifest_files(manifest))
+ 
+ 
++def trellismx_declared_sizes(root: str | Path) -> dict[str, int] | None:
++    """Stored, expansion and draft byte declarations for a per-expert release.
++
++    None for a root that is not a per-expert release. Expansion and draft bytes
++    are computed from the manifest's file records and the per-rank geometry.
++    """
++    root = Path(root).expanduser()
++    manifest = _manifest(root)
++    if manifest is None or manifest.get("schema") != PER_EXPERT_MANIFEST_SCHEMA:
++        return None
++    files = _manifest_files(manifest)
++    scale_copy_bytes = 288 * (1024 * 128 + 4096 * 16)
++    rotation_bytes = 288 * 1536 * 2
++    p8_bytes = 2 * (2 * 4096 + 288 * 3 * 512 + 3 * 512) + 4 * 288 + 4
++    rate_tables_bytes = 4 * 288 * 4
++    expansion_per_file = scale_copy_bytes + rotation_bytes + p8_bytes + rate_tables_bytes
++    expansion_bytes = len(files) * expansion_per_file
++    draft_sidecar_bytes = sum(size for path, size in files if "/p8-layer-045-" in path)
++    if any("/p8-layer-045-" in path for path, _ in files):
++        draft_bytes = 369_670_784 + draft_sidecar_bytes + 4 * expansion_per_file
++    else:
++        draft_bytes = 369_670_784
++    return {"stored_bytes": trellismx_stored_bytes(root), "expansion_bytes": expansion_bytes,
++            "draft_bytes": draft_bytes}
++
++
+ __all__ = [
+-    "CARRIER_DIRECTORY", "MANIFEST_NAME", "MANIFEST_SCHEMA", "SIDECAR_DIRECTORY", "TRANSFORM_PATH", "overlay_schema",
+-    "sidecar_path", "trellismx_assets_root", "trellismx_files_present", "trellismx_stored_bytes",
++    "CARRIER_DIRECTORY", "MANIFEST_NAME", "MANIFEST_SCHEMA", "MANIFEST_SCHEMAS", "PER_EXPERT_MANIFEST_SCHEMA",
++    "SIDECAR_DIRECTORY", "TRANSFORM_PATH", "overlay_schema", "sidecar_path", "trellismx_assets_root",
++    "trellismx_files_present", "trellismx_stored_bytes", "trellismx_declared_sizes",
+ ]
+diff -ruN --no-dereference '--exclude=__pycache__' '--exclude=.pytest_cache' ./ignition/recipes/__init__.py ./ignition/recipes/__init__.py
+--- ./ignition/recipes/__init__.py	2026-10-31 16:46:59.000000000 -0400
++++ ./ignition/recipes/__init__.py	2026-11-12 22:10:48.916745719 -0500
+@@ -179,8 +179,11 @@
+         raise _unsupported(f"{source} has no readable config.json architecture") from error
+     for recipe in recipes():
+         for checkpoint in recipe.checkpoints:
+-            if (isinstance(architectures, list) and checkpoint.architecture in architectures
+-                    and checkpoint.overlay == (overlay or "")):
++            packaging = checkpoint.overlay == (overlay or "")
++            if (overlay == "trellismx.hf-overlay-release.v2-per-expert"
++                    and checkpoint.overlay == "trellismx.hf-overlay-release.v1"):
++                packaging = True
++            if isinstance(architectures, list) and checkpoint.architecture in architectures and packaging:
+                 return recipe, checkpoint
+     packaging = f" packaged as {overlay}" if overlay else ""
+     raise _unsupported(f"no recipe supports architecture {architectures!r}{packaging} in {source}")
+@@ -196,7 +199,9 @@
+     return stored
+ 
+ 
+-def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int) -> Checkpoint:
++def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int, *,
++                 overlay: str | None = None, expansion_bytes: int | None = None,
++                 draft_bytes: int | None = None) -> Checkpoint:
+     """Describe another checkpoint of a recipe's model, scaling placement from the qualified checkpoint."""
+     scale = stored_bytes / qualified.stored_bytes
+     return replace(qualified, repository=repository, revision=revision, stored_bytes=stored_bytes,
+@@ -204,7 +209,9 @@
+                    scale_compressed_device_bytes={encoding: round(size * scale)
+                        for encoding, size in qualified.scale_compressed_device_bytes.items()},
+                    mapped_host_bytes=round(qualified.mapped_host_bytes * scale),
+-                   expansion_bytes=round(qualified.expansion_bytes * scale))
++                   overlay=qualified.overlay if overlay is None else overlay,
++                   draft_bytes=qualified.draft_bytes if draft_bytes is None else draft_bytes,
++                   expansion_bytes=round(qualified.expansion_bytes * scale) if expansion_bytes is None else expansion_bytes)
+ 
+ 
+ def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None) -> tuple[Path, Path]:
+@@ -241,13 +248,16 @@
+                 # A directory that a recipe declares keeps its declared placement.
+                 if Path(checkpoint.repository).is_absolute() and Path(checkpoint.repository).resolve() == directory:
+                     return ResolvedModel(recipe, checkpoint, directory)
+-        from ignition.preparation.trellismx_release import overlay_schema, trellismx_stored_bytes
++        from ignition.preparation.trellismx_release import (
++            overlay_schema, trellismx_declared_sizes, trellismx_stored_bytes,
++        )
+ 
+         # An overlay release is placed like the checkpoint declared with its packaging, and stores
+         # its carrier's payload plus every file its manifest names.
+         try:
+             overlay = overlay_schema(directory)
+             overlay_stored = None if overlay is None else trellismx_stored_bytes(directory)
++            declared_sizes = trellismx_declared_sizes(directory)
+         except ValueError as error:
+             raise UsageError(f"{directory} has an unreadable release manifest: {error}") from error
+         recipe, qualified = _supporting(metadata / "config.json", str(directory), overlay)
+@@ -259,7 +269,11 @@
+                   overlay_stored if overlay_stored is not None else
+                   _stored_bytes(index, str(directory)) if index.exists() else
+                   single.stat().st_size if single.is_file() else qualified.stored_bytes)
+-        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
++        return ResolvedModel(recipe, _replacement(
++            qualified, str(directory), revision, stored,
++            overlay=overlay,
++            expansion_bytes=None if declared_sizes is None else declared_sizes["expansion_bytes"],
++            draft_bytes=None if declared_sizes is None else declared_sizes["draft_bytes"]), directory)
+     repository, _, revision = model.partition("@")
+     if "/" not in repository:
+         for recipe in recipes():
+diff -ruN --no-dereference '--exclude=__pycache__' '--exclude=.pytest_cache' ./ignition/recipes/glm53/trellismx.py ./ignition/recipes/glm53/trellismx.py
+--- ./ignition/recipes/glm53/trellismx.py	2026-10-31 16:46:59.000000000 -0400
++++ ./ignition/recipes/glm53/trellismx.py	2026-11-12 22:48:47.175081341 -0500
+@@ -35,7 +35,7 @@
+ from typing import TYPE_CHECKING
+ 
+ from ignition.preparation.trellismx_release import (
+-    CARRIER_DIRECTORY, MANIFEST_NAME, MANIFEST_SCHEMA, TRANSFORM_PATH, sidecar_path,
++    CARRIER_DIRECTORY, MANIFEST_NAME, MANIFEST_SCHEMA, PER_EXPERT_MANIFEST_SCHEMA, TRANSFORM_PATH, sidecar_path,
+ )
+ 
+ 
+@@ -45,6 +45,13 @@
+ 
+ CHECKPOINT_ID = "codec-v2-uniform-k4-mtp45-k4"
+ SIDECAR_SCHEMA = "glm53-p8-coupled-h512-h128-tp4-rank.v1"
++PER_EXPERT_CHECKPOINT_ID = "codec-v2-per-expert-k2-p25-k3"
++PER_EXPERT_SIDECAR_SCHEMA = "glm53-p8-coupled-h512-h128-tp4-rank-per-expert.v1"
++RATE_SET = ("k2", "p25", "k3")
++RATE_CODES = {"k2": 0, "p25": 1, "k3": 2}
++RATE_WORDS = {"k2": 32, "p25": 40, "k3": 48}
++PAIR_MIX_MULTIPLIER = "1664525"
++PAIR_MIX_INCREMENT = "1013904223"
+ 
+ # Geometry the recipe and every sidecar's metadata agree on.
+ HIDDEN_SIZE = 4096
+@@ -71,8 +78,31 @@
+     "gate_up_suh_fp16": "F16",
+     "down_svh_fp16": "F16",
+ }
++PER_EXPERT_TENSOR_DTYPES = {
++    "expert_rate_u8": "U8",
++    "expert_slot_u16": "U16",
++    **{f"w13_trellis_{rate}": "I16" for rate in RATE_SET},
++    **{f"w2_trellis_{rate}": "I16" for rate in RATE_SET},
++    "w13_scale_ue8m0": "U8",
++    "w2_scale_ue8m0": "U8",
++    "intermediate_scales_fp16": "F16",
++    "coupled_sign_draw_u8": "U8",
++    "gate_up_suh_fp16": "F16",
++    "down_svh_fp16": "F16",
++}
++CSF_TENSOR_DTYPES = {
++    "w13_scale_csf_plane": "U8",
++    "w13_scale_csf_exceptions": "U32",
++    "w13_scale_csf_offsets": "I64",
++    "w2_scale_csf_plane": "U8",
++    "w2_scale_csf_exceptions": "U32",
++    "w2_scale_csf_offsets": "I64",
++}
+ _NUMPY_DTYPES = {"I16": "int16", "U8": "uint8", "F16": "float16"}
+-_ELEMENT_BYTES = {"I16": 2, "U8": 1, "F16": 2}
++_NUMPY_DTYPES["U16"] = "uint16"
++_NUMPY_DTYPES["U32"] = "uint32"
++_NUMPY_DTYPES["I64"] = "int64"
++_ELEMENT_BYTES = {"I16": 2, "U8": 1, "U16": 2, "U32": 4, "I64": 8, "F16": 2}
+ # A sidecar header is a few KiB; anything near this bound is not one.
+ _MAX_HEADER_BYTES = 100 << 20
+ 
+@@ -139,6 +169,7 @@
+     bytes: int
+     sha256: str
+     source_design_sha256: str
++    rates: tuple[int, int, int] = ()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -149,13 +180,17 @@
+     manifest_sha256: str
+     layers: tuple[int, ...]
+     world_size: int
+-    bits: int
++    bits: int | None
+     mtp_layer: int
+     carrier_repository: str
+     carrier_revision: str
+     files: tuple[TrellisMxSidecar, ...]
+     # SHA-256 of design/transform.json, the encoder transform every sidecar records.
+     transform_sha256: str
++    # Per-expert fields are empty for the uniform release.
++    kind: str = "uniform"
++    rates: tuple[tuple[str, ...], ...] = ()
++    rate_assignment_sha256: str = ""
+ 
+     @property
+     def carrier_root(self) -> Path:
+@@ -253,6 +288,53 @@
+     return tuple(files)
+ 
+ 
++def _manifest_files_per_expert(manifest: dict, root: Path, layers: tuple[int, ...], world_size: int,
++                               allocation: dict[int, tuple[int, int, int]]) -> tuple[TrellisMxSidecar, ...]:
++    """Gate 4 for a per-expert release: file inventory and each file's rate counts."""
++    entries = manifest.get("files")
++    if not isinstance(entries, list):
++        raise _gate(4, "manifest files must be a list")
++    if len(entries) != len(layers) * world_size:
++        raise _gate(4, f"manifest lists {len(entries)} sidecars for {len(layers)} layers"
++                       f" and {world_size} ranks, expected {len(layers) * world_size}")
++    seen, files = set(), []
++    for entry in entries:
++        if not isinstance(entry, dict):
++            raise _gate(4, f"sidecar entry must be an object, got {entry!r}")
++        layer = _int_field(entry.get("layer"), "sidecar entry layer")
++        rank = _int_field(entry.get("rank"), "sidecar entry rank")
++        expected_path = sidecar_path(layer, rank, world_size)
++        if entry.get("path") != expected_path:
++            raise _gate(4, f"sidecar path {entry.get('path')!r} does not name layer {layer} rank {rank}"
++                           f" ({expected_path})")
++        if (layer, rank) in seen:
++            raise _gate(4, f"duplicate sidecar for layer {layer} rank {rank}")
++        rates = _rate_counts(entry.get("rates"))
++        if layer not in layers or not 0 <= rank < world_size:
++            raise _gate(4, f"sidecar for layer {layer} rank {rank} is outside the declared allocation")
++        if rates is None:
++            raise _gate(4, f"{expected_path}: rates must map {list(RATE_SET)} to counts summing to"
++                           f" {NUM_EXPERTS}, got {entry.get('rates')!r}")
++        if rates != allocation[layer]:
++            raise _gate(4, f"{expected_path}: rates {entry.get('rates')!r} differ from the layer allocation"
++                           f" {dict(zip(RATE_SET, allocation[layer]))!r}")
++        size = _int_field(entry.get("bytes"), f"{expected_path} bytes")
++        digest = entry.get("sha256")
++        design = entry.get("source_design_sha256")
++        if not _sha256_field(digest) or not _sha256_field(design):
++            raise _gate(4, f"{expected_path}: file and source-design SHA-256 must be 64 lowercase hex digits")
++        path = root / expected_path
++        if not path.is_file():
++            raise _gate(4, f"missing sidecar {path}")
++        actual = path.stat().st_size
++        if actual != size:
++            raise _gate(4, f"{path}: {actual} bytes, manifest declares {size}")
++        seen.add((layer, rank))
++        files.append(TrellisMxSidecar(layer, rank, path, size, digest, design, rates))
++    files.sort(key=lambda entry: (entry.layer, entry.rank))
++    return tuple(files)
++
++
+ def _unique_object(pairs):
+     result = {}
+     for key, value in pairs:
+@@ -368,6 +450,57 @@
+     }
+ 
+ 
++def _rate_counts(value) -> tuple[int, int, int] | None:
++    if not isinstance(value, dict):
++        return None
++    counts = tuple(value.get(rate) for rate in RATE_SET)
++    if any(type(count) is not int or count < 0 for count in counts) or sum(counts) != NUM_EXPERTS:
++        return None
++    return counts
++
++
++def expected_per_expert_tensor_shapes(rate_counts: tuple[int, int, int], local_intermediate_size: int,
++                                      *, scale_storage: str = "plain") -> dict[str, tuple[int, ...]]:
++    """One rank's per-expert tensors, with absent banks omitted."""
++    if len(rate_counts) != len(RATE_SET) or sum(rate_counts) != NUM_EXPERTS:
++        raise ValueError(f"per-expert rate counts {rate_counts!r} must sum to {NUM_EXPERTS}")
++    if scale_storage not in ("plain", "csf"):
++        raise ValueError(f"scale storage must be 'plain' or 'csf', got {scale_storage!r}")
++    if (type(local_intermediate_size) is not int or local_intermediate_size <= 0
++            or local_intermediate_size % SLOT_CHANNELS or GLOBAL_INTERMEDIATE % local_intermediate_size):
++        raise ValueError(f"trellismx local intermediate size must divide {GLOBAL_INTERMEDIATE} into"
++                         f" {SLOT_CHANNELS}-channel slots, got {local_intermediate_size!r}")
++    row_groups = 2 * local_intermediate_size // SLOT_CHANNELS
++    hidden_tiles = HIDDEN_SIZE // 16
++    shapes = {
++        "expert_rate_u8": (NUM_EXPERTS,),
++        "expert_slot_u16": (NUM_EXPERTS,),
++    }
++    for rate, count, words in zip(RATE_SET, rate_counts, (32, 40, 48), strict=True):
++        if count:
++            shapes[f"w13_trellis_{rate}"] = (2, count, hidden_tiles, row_groups, words)
++            shapes[f"w2_trellis_{rate}"] = (count, row_groups, hidden_tiles, words)
++    common = {
++        "intermediate_scales_fp16": (NUM_EXPERTS, 3 * local_intermediate_size),
++        "coupled_sign_draw_u8": (NUM_EXPERTS,),
++        "gate_up_suh_fp16": (HIDDEN_SIZE,),
++        "down_svh_fp16": (HIDDEN_SIZE,),
++    }
++    if scale_storage == "plain":
++        common["w13_scale_ue8m0"] = (NUM_EXPERTS, 2 * local_intermediate_size, HIDDEN_SIZE // 32)
++        common["w2_scale_ue8m0"] = (NUM_EXPERTS, HIDDEN_SIZE, local_intermediate_size // 32)
++    else:
++        common["w13_scale_csf_plane"] = (
++            NUM_EXPERTS, 2 * local_intermediate_size // 16, 16 * (1 + (HIDDEN_SIZE // 32 + 7) // 8))
++        common["w13_scale_csf_exceptions"] = (None,)
++        common["w13_scale_csf_offsets"] = (NUM_EXPERTS + 1,)
++        common["w2_scale_csf_plane"] = (
++            NUM_EXPERTS, HIDDEN_SIZE // 16, 16 * (1 + (local_intermediate_size // 32 + 7) // 8))
++        common["w2_scale_csf_exceptions"] = (None,)
++        common["w2_scale_csf_offsets"] = (NUM_EXPERTS + 1,)
++    return {**shapes, **common}
++
++
+ def validate_sidecar_tensors(tensors: dict[str, tuple[str, tuple[int, ...]]], *, layer: int, rank: int,
+                              local_intermediate_size: int) -> None:
+     """The shape and dtype gate of the release contract, without reading payloads."""
+@@ -383,6 +516,100 @@
+                              f" expected {TENSOR_DTYPES[name]} {shape}")
+ 
+ 
++def validate_per_expert_sidecar_metadata(metadata: dict[str, str], *, layer: int, rank: int,
++                                         expected_design_sha256: str | None = None,
++                                         expected_transform_sha256: str | None = None,
++                                         expected_rate_assignment_sha256: str | None = None) -> tuple[int, int, int]:
++    """Validate one per-expert sidecar's metadata and return its rate counts."""
++    for name, expected in SIDECAR_IDENTITY.items():
++        if name in ("bits", "schema"):
++            continue
++        if metadata.get(name) != expected:
++            raise _gate(5, f"layer {layer} rank {rank}: metadata {name} is {metadata.get(name)!r},"
++                           f" expected {expected!r}")
++    if metadata.get("schema") != PER_EXPERT_SIDECAR_SCHEMA:
++        raise _gate(5, f"layer {layer} rank {rank}: schema is {metadata.get('schema')!r},"
++                       f" expected {PER_EXPERT_SIDECAR_SCHEMA!r}")
++    if metadata.get("rate_set") != ",".join(RATE_SET):
++        raise _gate(5, f"layer {layer} rank {rank}: rate_set is {metadata.get('rate_set')!r},"
++                       f" expected {','.join(RATE_SET)!r}")
++    if metadata.get("scale_storage") not in ("plain", "csf"):
++        raise _gate(5, f"layer {layer} rank {rank}: scale_storage must be plain or csf,"
++                       f" got {metadata.get('scale_storage')!r}")
++    counts = tuple(
++        int(metadata.get(f"experts_{rate}")) if str(metadata.get(f"experts_{rate}")).isdigit() else -1
++        for rate in RATE_SET)
++    if counts == (-1, -1, -1) or sum(counts) != NUM_EXPERTS or any(count < 0 for count in counts):
++        raise _gate(5, f"layer {layer} rank {rank}: rate counts are"
++                       f" {[metadata.get(f'experts_{rate}') for rate in RATE_SET]!r}, must sum to {NUM_EXPERTS}")
++    if (metadata.get("pair_mix_multiplier") != PAIR_MIX_MULTIPLIER
++            or metadata.get("pair_mix_increment") != PAIR_MIX_INCREMENT):
++        raise _gate(5, f"layer {layer} rank {rank}: pair constants are"
++                       f" ({metadata.get('pair_mix_multiplier')!r}, {metadata.get('pair_mix_increment')!r}),"
++                       f" expected ({PAIR_MIX_MULTIPLIER!r}, {PAIR_MIX_INCREMENT!r})")
++    if not str(metadata.get("weight_payload_bits", "")).isdigit():
++        raise _gate(5, f"layer {layer} rank {rank}: weight_payload_bits must be a nonnegative decimal integer")
++    expected_bits = round(sum(count * bits * 6_291_456
++                              for count, bits in zip(counts, (2.0, 2.5, 3.0), strict=True)))
++    if int(metadata["weight_payload_bits"]) != expected_bits:
++        raise _gate(5, f"layer {layer} rank {rank}: weight_payload_bits is {metadata['weight_payload_bits']},"
++                       f" expected {expected_bits}")
++    if metadata.get("layer") != str(layer) or metadata.get("rank") != str(rank):
++        raise _gate(5, f"sidecar metadata names layer {metadata.get('layer')!r} rank {metadata.get('rank')!r},"
++                       f" not layer {layer} rank {rank}")
++    if metadata.get("local_atom_begin") != str(rank * (GLOBAL_INTERMEDIATE // WORLD_SIZE) // SLOT_CHANNELS):
++        raise _gate(5, f"layer {layer} rank {rank}: local_atom_begin is {metadata.get('local_atom_begin')!r},"
++                       f" expected {rank * (GLOBAL_INTERMEDIATE // WORLD_SIZE) // SLOT_CHANNELS}")
++    for name, expected in SIDECAR_CONTRACT.items():
++        if metadata.get(name) != expected:
++            raise ValueError(f"trellismx sidecar layer {layer} rank {rank}: {name} is {metadata.get(name)!r},"
++                             f" but the coupled contract requires {expected!r}")
++    if expected_design_sha256 is not None and metadata.get("source_design_sha256") != expected_design_sha256:
++        raise _gate(5, f"layer {layer} rank {rank}: source_design_sha256 is"
++                       f" {metadata.get('source_design_sha256')!r}, manifest declares {expected_design_sha256!r}")
++    if expected_transform_sha256 is not None and metadata.get("encoder_transform_sha256") != expected_transform_sha256:
++        raise _gate(5, f"layer {layer} rank {rank}: encoder_transform_sha256 is"
++                       f" {metadata.get('encoder_transform_sha256')!r}, but {TRANSFORM_PATH} hashes to"
++                       f" {expected_transform_sha256!r}")
++    if (expected_rate_assignment_sha256 is not None
++            and metadata.get("rate_assignment_sha256") != expected_rate_assignment_sha256):
++        raise _gate(5, f"layer {layer} rank {rank}: rate_assignment_sha256 is"
++                       f" {metadata.get('rate_assignment_sha256')!r}, release declares"
++                       f" {expected_rate_assignment_sha256!r}")
++    return counts
++
++
++def validate_per_expert_sidecar_tensors(tensors: dict[str, tuple[str, tuple[int, ...]]], *,
++                                        rate_counts: tuple[int, int, int], layer: int, rank: int,
++                                        local_intermediate_size: int) -> str:
++    """Validate one per-expert sidecar's tensor set and return its scale storage."""
++    scale_storage = "plain" if "w13_scale_ue8m0" in tensors else "csf" if "w13_scale_csf_plane" in tensors else ""
++    if scale_storage == "":
++        raise ValueError(f"trellismx sidecar layer {layer} rank {rank} has neither plain nor CSF scale planes")
++    expected = expected_per_expert_tensor_shapes(rate_counts, local_intermediate_size,
++                                                 scale_storage=scale_storage)
++    if set(tensors) != set(expected):
++        missing = sorted(set(expected) - set(tensors))
++        extra = sorted(set(tensors) - set(expected))
++        raise ValueError(f"trellismx sidecar layer {layer} rank {rank} tensor set differs from the release"
++                         f" contract: missing {missing}, unexpected {extra}")
++    all_dtypes = {**PER_EXPERT_TENSOR_DTYPES, **CSF_TENSOR_DTYPES}
++    fixed_shapes = {name: shape for name, shape in expected.items()
++                    if name not in ("w13_scale_csf_exceptions", "w2_scale_csf_exceptions")}
++    for name, shape in fixed_shapes.items():
++        dtype, actual = tensors[name]
++        if dtype != all_dtypes[name] or actual != shape:
++            raise ValueError(f"trellismx sidecar layer {layer} rank {rank}: {name} is {dtype} {actual},"
++                             f" expected {all_dtypes[name]} {shape}")
++    if scale_storage == "csf":
++        for name in ("w13_scale_csf_exceptions", "w2_scale_csf_exceptions"):
++            dtype, actual = tensors[name]
++            if dtype != CSF_TENSOR_DTYPES[name] or len(actual) != 1 or actual[0] < 0:
++                raise ValueError(f"trellismx sidecar layer {layer} rank {rank}: {name} is {dtype} {actual},"
++                                 f" expected one-dimensional {CSF_TENSOR_DTYPES[name]}")
++    return scale_storage
++
++
+ def _config_gates(config: dict) -> None:
+     """Gate 6: the architecture and geometry the recipe prepares, and which tensors are quantized."""
+     if config.get("architectures") != ["Glm5NextForConditionalGeneration"]:
+@@ -412,8 +639,182 @@
+         changed = sorted(name for name in set(actual) & set(expected) if actual[name] != expected[name])
+         raise _gate(6, "quantized_layers must declare exactly the routed expert modules the sidecars replace,"
+                        f" each as {_QUANTIZED_LAYERS[FIRST_ROUTED_LAYER]} (layer {MTP_LAYER}:"
+-                       f" {_QUANTIZED_LAYERS[MTP_LAYER]}): missing {missing}, unexpected {unexpected},"
+-                       f" changed {changed}")
++                        f" {_QUANTIZED_LAYERS[MTP_LAYER]}): missing {missing}, unexpected {unexpected},"
++                        f" changed {changed}")
++
++
++def _is_per_expert_overlay(root: Path, manifest: dict, manifest_bytes: bytes) -> TrellisMxRelease:
++    """Detect and validate a per-expert K2/P25/K3 TrellisMX overlay release."""
++    if manifest.get("checkpoint") != PER_EXPERT_CHECKPOINT_ID:
++        raise _gate(2, f"checkpoint is {manifest.get('checkpoint')!r},"
++                       f" expected {PER_EXPERT_CHECKPOINT_ID!r}")
++    allocation_document = manifest.get("allocation")
++    if not isinstance(allocation_document, dict) or not allocation_document:
++        raise _gate(2, "allocation must be a nonempty object of layer indices")
++    allocation = {}
++    for layer, counts in allocation_document.items():
++        try:
++            index = int(layer)
++        except (TypeError, ValueError) as error:
++            raise _gate(2, f"allocation keys must be layer indices, got {layer!r}") from error
++        if layer != str(index):
++            raise _gate(2, f"allocation key {layer!r} is not the canonical layer index {str(index)!r}")
++        rates = _rate_counts(counts)
++        if rates is None:
++            raise _gate(2, f"allocation[{layer}] must map {list(RATE_SET)} to counts summing to"
++                           f" {NUM_EXPERTS}, got {counts!r}")
++        allocation[index] = rates
++    routed = set(range(FIRST_ROUTED_LAYER, MTP_LAYER + 1))
++    if not allocation or not set(allocation).issubset(routed):
++        raise _gate(2, f"allocation covers layers {sorted(allocation)}, expected a subset of"
++                       f" {FIRST_ROUTED_LAYER} through {MTP_LAYER}")
++    mtp = manifest.get("mtp")
++    if MTP_LAYER in allocation:
++        mtp_rates = _rate_counts(mtp.get("rates")) if isinstance(mtp, dict) else None
++        if (not isinstance(mtp, dict) or mtp.get("layer") != MTP_LAYER or mtp_rates is None
++                or mtp_rates != allocation[MTP_LAYER]):
++            raise _gate(2, f"mtp must declare layer {MTP_LAYER} with layer {MTP_LAYER}'s rates, got {mtp!r}")
++    elif mtp is not None:
++        raise _gate(2, f"a release without layer {MTP_LAYER} must omit mtp, got {mtp!r}")
++
++    carrier = manifest.get("carrier")
++    if not isinstance(carrier, dict):
++        raise _gate(3, "manifest carrier must be an object")
++    repository, revision = carrier.get("repo_id"), carrier.get("revision")
++    if (not isinstance(repository, str) or not repository
++            or not isinstance(revision, str) or len(revision) != 40
++            or any(character not in "0123456789abcdef" for character in revision)):
++        raise _gate(3, f"manifest carrier must pin a repository and a 40-digit revision, got {carrier!r}")
++    carrier_root = root / CARRIER_DIRECTORY
++    for name in ("model.safetensors.index.json", "config.json"):
++        if not (carrier_root / name).is_file():
++            raise _gate(3, f"carrier directory {carrier_root} has no {name}")
++    carrier_config = _json_object(carrier_root / "config.json", "carrier config.json")
++    root_config = _json_object(root / "config.json", "release config.json")
++    if carrier_config != root_config:
++        raise _gate(3, "the release's config.json differs from the carrier's: the root does not describe"
++                       " the carrier the sidecars overlay")
++    _config_gates(root_config)
++
++    layers = tuple(sorted(allocation))
++    files = _manifest_files_per_expert(manifest, root, layers, WORLD_SIZE, allocation)
++    if not (root / TRANSFORM_PATH).is_file():
++        raise _gate(4, f"missing {root / TRANSFORM_PATH}, the encoder transform the sidecars pin")
++    transform_sha256 = hashlib.sha256((root / TRANSFORM_PATH).read_bytes()).hexdigest()
++    assignment_sha256, assignment = _rate_assignment(manifest, root, allocation)
++
++    rate_arrays = {}
++    payload_bits = 0
++    for entry in files:
++        metadata, tensors = sidecar_header(entry.path)
++        counts = validate_per_expert_sidecar_metadata(
++            metadata, layer=entry.layer, rank=entry.rank, expected_design_sha256=entry.source_design_sha256,
++            expected_transform_sha256=transform_sha256, expected_rate_assignment_sha256=assignment_sha256)
++        if counts != entry.rates:
++            raise _gate(5, f"layer {entry.layer} rank {entry.rank}: metadata rate counts"
++                           f" {dict(zip(RATE_SET, counts))} differ from the manifest's {dict(zip(RATE_SET, entry.rates))}")
++        scale_storage = validate_per_expert_sidecar_tensors(
++            tensors, rate_counts=counts, layer=entry.layer, rank=entry.rank,
++            local_intermediate_size=GLOBAL_INTERMEDIATE // WORLD_SIZE)
++        for name in tensors:
++            if not _sha256_field(metadata.get(f"sha256_{name}")):
++                raise _gate(5, f"layer {entry.layer} rank {entry.rank}: metadata sha256_{name} must be"
++                               " 64 lowercase hex digits")
++        if scale_storage == "csf" and not all(_sha256_field(metadata.get(f"sha256_{name}"))
++                                               for name in ("w13_scale_ue8m0", "w2_scale_ue8m0")):
++            raise _gate(5, f"layer {entry.layer} rank {entry.rank}: a CSF sidecar must record both expanded"
++                           " scale-plane hashes")
++        rates = _declared_rate_bytes(entry.path)
++        expected = tuple(RATE_CODES[name] for name in assignment["layers"][str(entry.layer)])
++        if rates != expected:
++            raise _gate(5, f"layer {entry.layer} rank {entry.rank}: expert_rate_u8 differs from"
++                           f" design/rate-assignment.json")
++        if entry.layer in rate_arrays and rate_arrays[entry.layer] != rates:
++            raise _gate(5, f"layer {entry.layer}: rank {entry.rank} records different expert rates than another rank")
++        rate_arrays[entry.layer] = rates
++        payload_bits += int(metadata["weight_payload_bits"])
++
++    payload = manifest.get("payload")
++    if (not isinstance(payload, dict)
++            or payload.get("file_bytes") != sum(entry.bytes for entry in files)
++            or payload.get("weight_payload_bits") != payload_bits):
++        raise _gate(4, "manifest payload byte and bit totals differ from its files and sidecar metadata")
++    return TrellisMxRelease(
++        root=root, manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(), layers=layers,
++        world_size=WORLD_SIZE, bits=None, mtp_layer=MTP_LAYER, carrier_repository=repository,
++        carrier_revision=revision, files=files, transform_sha256=transform_sha256, kind="per-expert",
++        rates=tuple(allocation[layer] for layer in layers),
++        rate_assignment_sha256=assignment_sha256)
++
++
++def _canonical_sha256(document: dict) -> str:
++    return hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++
++
++def _rate_assignment(manifest: dict, root: Path, allocation: dict[int, tuple[int, int, int]]) -> tuple[str, dict]:
++    """Validate ``design/rate-assignment.json`` against the manifest and allocation."""
++    declared = manifest.get("rate_assignment")
++    if not isinstance(declared, dict):
++        raise _gate(2, "rate_assignment must be an object")
++    path_name, digest = declared.get("path"), declared.get("sha256")
++    if path_name != "design/rate-assignment.json" or not _sha256_field(digest):
++        raise _gate(2, "rate_assignment must name design/rate-assignment.json and a 64-digit SHA-256")
++    if declared.get("rule") not in ("route-mass", "shapley"):
++        raise _gate(2, f"rate_assignment rule must be route-mass or shapley, got {declared.get('rule')!r}")
++    for name in ("budget_bits", "achieved_bits"):
++        value = declared.get(name)
++        if type(value) not in (int, float) or value <= 0:
++            raise _gate(2, f"rate_assignment {name} must be positive, got {value!r}")
++    path = root / path_name
++    document = _json_object(path, "rate assignment")
++    if document.get("schema") != "trellismx.rate-assignment.v1":
++        raise _gate(2, f"rate assignment schema is {document.get('schema')!r},"
++                       " expected 'trellismx.rate-assignment.v1'")
++    if document.get("rule") != declared.get("rule") or document.get("budget_bits") != declared.get("budget_bits"):
++        raise _gate(2, "rate assignment rule or budget differs from the manifest's rate_assignment")
++    if not isinstance(document.get("source"), dict):
++        raise _gate(2, "rate assignment source must be an object")
++    layers = document.get("layers")
++    if not isinstance(layers, dict) or set(layers) != {str(layer) for layer in allocation}:
++        raise _gate(2, "rate assignment layers differ from the release allocation")
++    for layer, rates in layers.items():
++        if (not isinstance(rates, list) or len(rates) != NUM_EXPERTS
++                or any(rate not in RATE_CODES for rate in rates)):
++            raise _gate(2, f"rate assignment layer {layer} must name a known rate for each of {NUM_EXPERTS} experts")
++        counts = tuple(rates.count(rate) for rate in RATE_SET)
++        if counts != allocation[int(layer)]:
++            raise _gate(2, f"rate assignment layer {layer} counts {dict(zip(RATE_SET, counts))} differ from"
++                           f" the manifest allocation {dict(zip(RATE_SET, allocation[int(layer)]))}")
++    actual = _canonical_sha256(document)
++    if actual != digest:
++        raise _gate(2, f"rate assignment canonical SHA-256 is {actual}, manifest declares {digest}")
++    return actual, document
++
++
++def _declared_rate_bytes(path: Path) -> tuple[int, ...]:
++    """Read only ``expert_rate_u8`` from a sidecar header's declared geometry."""
++    import numpy
++
++    try:
++        with path.open("rb", buffering=0) as source:
++            size = os.fstat(source.fileno()).st_size
++            length = _header_length(source.read(8), size, path)
++            raw = source.read(length)
++    except OSError as error:
++        raise ValueError(f"sidecar {path} is unreadable: {error}") from error
++    metadata, entries = _header_entries(
++        raw, size, path)
++    if "expert_rate_u8" not in entries:
++        raise ValueError(f"sidecar {path} has no expert_rate_u8")
++    dtype, shape, offset = entries["expert_rate_u8"]
++    if dtype != "U8" or shape != (NUM_EXPERTS,):
++        raise ValueError(f"sidecar {path}: expert_rate_u8 must be U8 {(NUM_EXPERTS,)}")
++    with path.open("rb", buffering=0) as source:
++        source.seek(offset)
++        raw = source.read(NUM_EXPERTS)
++    if len(raw) != NUM_EXPERTS:
++        raise ValueError(f"sidecar {path}: truncated expert_rate_u8")
++    return tuple(int(value) for value in numpy.frombuffer(raw, dtype=numpy.uint8))
+ 
+ 
+ def is_trellismx_overlay(root: str | Path) -> TrellisMxRelease | None:
+@@ -433,6 +834,8 @@
+     # One read: the recorded identity is the digest of the very bytes every gate parses.
+     manifest_bytes = _read_bytes(manifest_path, "trellismx manifest")
+     manifest = _json_document(manifest_bytes, manifest_path, "trellismx manifest")
++    if manifest.get("schema") == PER_EXPERT_MANIFEST_SCHEMA:
++        return _is_per_expert_overlay(root, manifest, manifest_bytes)
+     if manifest.get("schema") != MANIFEST_SCHEMA:
+         return None
+ 
+@@ -545,11 +948,21 @@
+     buffer = _read_verified(entry)
+     raw = bytes(buffer[8:8 + _header_length(bytes(buffer[:8]), len(buffer), entry.path)])
+     metadata, entries = _header_entries(raw, len(buffer), entry.path)
+-    validate_sidecar_metadata(metadata, layer=layer, rank=rank, world_size=release.world_size,
+-                              expected_design_sha256=entry.source_design_sha256,
+-                              expected_transform_sha256=release.transform_sha256)
+-    validate_sidecar_tensors({name: (dtype, shape) for name, (dtype, shape, _) in entries.items()},
+-                             layer=layer, rank=rank, local_intermediate_size=release.local_intermediate_size())
++    geometry = {name: (dtype, shape) for name, (dtype, shape, _) in entries.items()}
++    if release.kind == "per-expert":
++        counts = validate_per_expert_sidecar_metadata(
++            metadata, layer=layer, rank=rank, expected_design_sha256=entry.source_design_sha256,
++            expected_transform_sha256=release.transform_sha256,
++            expected_rate_assignment_sha256=release.rate_assignment_sha256)
++        scale_storage = validate_per_expert_sidecar_tensors(
++            geometry, rate_counts=counts, layer=layer, rank=rank,
++            local_intermediate_size=release.local_intermediate_size())
++    else:
++        validate_sidecar_metadata(metadata, layer=layer, rank=rank, world_size=release.world_size,
++                                  expected_design_sha256=entry.source_design_sha256,
++                                  expected_transform_sha256=release.transform_sha256)
++        validate_sidecar_tensors(geometry, layer=layer, rank=rank,
++                                 local_intermediate_size=release.local_intermediate_size())
+     arrays = {}
+     for name, (dtype, shape, offset) in entries.items():
+         array = numpy.frombuffer(buffer, dtype=numpy.dtype(_NUMPY_DTYPES[dtype]).newbyteorder("<"),
+@@ -558,9 +971,57 @@
+         if not (array.dtype.isnative and array.flags.aligned):
+             array = array.astype(array.dtype.newbyteorder("="))
+         arrays[name] = array
++        if release.kind == "per-expert":
++            digest = hashlib.sha256(array.tobytes(order="C")).hexdigest()
++            if metadata.get(f"sha256_{name}") != digest:
++                raise ValueError(f"trellismx sidecar {entry.path}: tensor {name} SHA-256 is {digest},"
++                                 f" metadata declares {metadata.get(f'sha256_{name}')!r}")
++            if name == "expert_rate_u8":
++                _validate_rate_and_slot_arrays(arrays)
++    if release.kind == "per-expert" and scale_storage == "csf":
++        _expand_csf_arrays(arrays, metadata, entry.path)
+     return entry, metadata, arrays
+ 
+ 
++def _expand_csf_arrays(arrays: dict[str, numpy.ndarray], metadata: dict[str, str], path: Path) -> None:
++    """Expand both CSF scale planes and verify their recorded plain-plane hashes."""
++    import torch
++    from b12x.moe.fused_moe.trellismx import csf_scale_source, decode_csf_scale_plane
++
++    for prefix, rows, columns in (
++            ("w13", 2 * (GLOBAL_INTERMEDIATE // WORLD_SIZE), HIDDEN_SIZE // 32),
++            ("w2", HIDDEN_SIZE, GLOBAL_INTERMEDIATE // WORLD_SIZE // 32)):
++        source = csf_scale_source(
++            torch.from_numpy(arrays[f"{prefix}_scale_csf_plane"]),
++            torch.from_numpy(arrays[f"{prefix}_scale_csf_exceptions"]),
++            torch.from_numpy(arrays[f"{prefix}_scale_csf_offsets"]), rows=rows, columns=columns)
++        grid, _ = decode_csf_scale_plane(source, name=f"{prefix} scale")
++        digest = hashlib.sha256(grid.contiguous().cpu().numpy().tobytes(order="C")).hexdigest()
++        expected = metadata[f"sha256_{prefix}_scale_ue8m0"]
++        if digest != expected:
++            raise ValueError(f"trellismx sidecar {path}: expanded {prefix} CSF plane SHA-256 is {digest},"
++                             f" metadata declares {expected}")
++        arrays[f"{prefix}_scale_ue8m0"] = grid.cpu().numpy()
++        for suffix in ("plane", "exceptions", "offsets"):
++            arrays.pop(f"{prefix}_scale_csf_{suffix}")
++
++
++def _validate_rate_and_slot_arrays(arrays: dict[str, numpy.ndarray]) -> None:
++    import numpy
++
++    rates = arrays["expert_rate_u8"]
++    slots = arrays["expert_slot_u16"]
++    if any(int(code) not in RATE_CODES.values() for code in rates):
++        raise ValueError(f"expert_rate_u8 holds an unknown code: {sorted(set(int(v) for v in rates))}")
++    expected_slots = numpy.empty(NUM_EXPERTS, dtype=slots.dtype)
++    seen = [0, 0, 0]
++    for expert, code in enumerate(int(value) for value in rates):
++        expected_slots[expert] = seen[code]
++        seen[code] += 1
++    if not numpy.array_equal(slots, expected_slots):
++        raise ValueError("expert_slot_u16 is not the expert's rank within its rate bank")
++
++
+ def load_sidecar_tensors(release: TrellisMxRelease, *, layer: int, rank: int, device,
+                          names: tuple[str, ...] | None = None) -> dict[str, "torch.Tensor"]:
+     """Read one sidecar's tensors after verifying the whole file against the release manifest.
+@@ -576,9 +1037,10 @@
+         raise ValueError(f"trellismx release {release.root} has no sidecar for layer {layer}")
+     if type(rank) is not int or not 0 <= rank < release.world_size:
+         raise ValueError(f"trellismx sidecar rank must be in [0, {release.world_size}), got {rank!r}")
+-    selected = tuple(TENSOR_DTYPES) if names is None else tuple(names)
+-    if not selected or any(name not in TENSOR_DTYPES for name in selected):
+-        raise ValueError(f"trellismx sidecar tensors must be drawn from {sorted(TENSOR_DTYPES)}, got {names!r}")
++    available = (TENSOR_DTYPES if release.kind == "uniform" else PER_EXPERT_TENSOR_DTYPES)
++    selected = tuple(available) if names is None else tuple(names)
++    if not selected or any(name not in available for name in selected):
++        raise ValueError(f"trellismx sidecar tensors must be drawn from {sorted(available)}, got {names!r}")
+     _, _, arrays = _verified_sidecar(release, layer, rank)
+     return {name: torch.from_numpy(arrays[name]).to(device) for name in selected}
+ 
+@@ -703,9 +1165,11 @@
+     """
+     import torch
+     from b12x.moe._shared.p8.p8_coupled_scales import SCALE_NAMES
+-    from b12x.moe.fused_moe.trellismx_p8_runtime import (
+-        GLM53_SERVING_OPTIONS, P8NativeTPMoE, P8TensorSource,
+-    )
++    from b12x.moe._shared.p8.options import GLM53_SERVING_OPTIONS, PER_EXPERT_TEST_OPTIONS
++    from b12x.moe._shared.p8.p8_native_kernel import P8NativeTPMoE, P8TensorSource
++    options = GLM53_SERVING_OPTIONS
++    if release.kind == "per-expert":
++        options = PER_EXPERT_TEST_OPTIONS
+ 
+     # The scale-component validator assembles its packed vectors on the CPU, exactly as
+     # from the sidecar file; the large planes stay where they are.
+@@ -716,21 +1180,30 @@
+         P8TensorSource(tensors, metadata), device=torch.device(device), tp_rank=rank, world_size=world_size,
+         layer=layer, topk=TOP_K, hidden=HIDDEN_SIZE, intermediate=local_intermediate_size,
+         swiglu_limit=SWIGLU_LIMIT, expected_design_sha256=entry.source_design_sha256,
+-        expected_transform_sha256=release.transform_sha256, options=GLM53_SERVING_OPTIONS)
++        expected_transform_sha256=release.transform_sha256, options=options)
+ 
+ 
+-def attach_p8(prepared, runtime):
++def attach_p8(prepared, runtime, *, release_kind: str = "uniform"):
+     """``prepared`` attached to ``runtime`` under b12x's in-tree backend declaration.
+ 
+     The runtime must have resolved b12x's declared GLM-5.3 Flash serving configuration;
+     b12x then records every setting it resolved and verifies the runtime against the bundle.
+     """
+     from b12x.moe.fused_moe.trellismx_p8 import attach_trellismx_p8_runtime
+-    from b12x.moe.fused_moe.trellismx_p8_runtime import GLM53_SERVING_OPTIONS, in_tree_p8_backend
++    from b12x.moe._shared.p8.options import GLM53_SERVING_OPTIONS, PER_EXPERT_TEST_OPTIONS
++    from b12x.moe.fused_moe.trellismx_p8_runtime import in_tree_p8_backend
+ 
+-    if runtime.options != GLM53_SERVING_OPTIONS:
+-        raise ValueError("the P8 runtime resolved a configuration other than b12x's GLM-5.3 Flash"
+-                         f" serving one: {runtime.options!r}")
++    expected = GLM53_SERVING_OPTIONS
++    if release_kind == "per-expert":
++        expected = PER_EXPERT_TEST_OPTIONS
++    elif release_kind != "uniform":
++        raise ValueError(f"unknown TrellisMX release kind {release_kind!r}")
++    if runtime.options != expected:
++        if release_kind == "uniform":
++            raise ValueError("the P8 runtime resolved a configuration other than b12x's GLM-5.3 Flash"
++                             f" serving one: {runtime.options!r}")
++        raise ValueError(f"the P8 runtime resolved a configuration other than the required one for a"
++                         f" {release_kind} release: {runtime.options!r}")
+     return attach_trellismx_p8_runtime(prepared, runtime, backend=in_tree_p8_backend())
+ 
+ 
+@@ -764,7 +1237,7 @@
+     for tensor in (runtime.w13_stream, runtime.w2_stream, runtime.w13_scale_mx, runtime.w2_scale_mx,
+                    runtime.w13_sfb, runtime.w2_sfb, runtime.scale_component_packed, runtime.ones):
+         record_numeric_tensor(tensor)
+-    return attach_p8(prepared, runtime)
++    return attach_p8(prepared, runtime, release_kind=release.kind)
+ 
+ 
+ def agree_on_release(release: TrellisMxRelease | None, group) -> None:
+@@ -820,9 +1293,12 @@
+ 
+ __all__ = [
+     "BITS", "CHECKPOINT_ID", "FIRST_ROUTED_LAYER", "GLOBAL_INTERMEDIATE", "HIDDEN_SIZE", "MANIFEST_NAME",
+-    "MANIFEST_SCHEMA", "MTP_LAYER", "NUM_EXPERTS", "SIDECAR_SCHEMA",
+-    "SWIGLU_LIMIT", "TOP_K", "TrellisMxRelease", "TrellisMxSidecar", "WORLD_SIZE", "agree_on_release", "attach_p8",
+-    "attach_p8_runtime", "expected_tensor_shapes", "is_trellismx_overlay", "load_sidecar_tensors",
+-    "load_trellis_experts", "p8_attachments", "p8_runtime", "p8_settings", "prepare_trellismx_experts",
+-    "sidecar_bytes", "sidecar_header", "validate_sidecar_metadata", "validate_sidecar_tensors",
++    "MANIFEST_SCHEMA", "MTP_LAYER", "NUM_EXPERTS", "PAIR_MIX_INCREMENT", "PAIR_MIX_MULTIPLIER",
++    "PER_EXPERT_CHECKPOINT_ID", "PER_EXPERT_SIDECAR_SCHEMA", "RATE_CODES", "RATE_SET", "RATE_WORDS",
++    "SIDECAR_SCHEMA", "SWIGLU_LIMIT", "TOP_K", "TrellisMxRelease", "TrellisMxSidecar", "WORLD_SIZE",
++    "agree_on_release", "attach_p8", "attach_p8_runtime", "expected_per_expert_tensor_shapes",
++    "expected_tensor_shapes", "is_trellismx_overlay", "load_sidecar_tensors", "load_trellis_experts",
++    "p8_attachments", "p8_runtime", "p8_settings", "prepare_trellismx_experts", "sidecar_bytes",
++    "sidecar_header", "validate_per_expert_sidecar_metadata", "validate_per_expert_sidecar_tensors",
++    "validate_sidecar_metadata", "validate_sidecar_tensors",
+ ]
+diff -ruN --no-dereference '--exclude=__pycache__' '--exclude=.pytest_cache' ./ignition/recipes/glm53/weights.py ./ignition/recipes/glm53/weights.py
+--- ./ignition/recipes/glm53/weights.py	2026-10-31 16:46:59.000000000 -0400
++++ ./ignition/recipes/glm53/weights.py	2026-11-12 22:23:41.770618174 -0500
+@@ -251,7 +251,7 @@
+             self.load_tensor(f"{prefix}.gate.e_score_correction_bias"),
+             self.load_experts(layer, scale_scratch=scale_scratch), shared,
+             experts_a4_prefill=csf and self.expert_activation == "a16",
+-            trellismx_release=self.trellismx,
++            trellismx_release=self.trellismx if layer in self.trellismx.layers else None,
+         )
+ 
+     def load_experts(self, layer, *, expert_ids=None, scale_scratch=None):
+@@ -262,7 +262,7 @@
+         if (not ids or len(set(ids)) != len(ids)
+                 or any(type(i) is not int or not 0 <= i < 288 for i in ids)):
+             raise ValueError("GLM expert IDs must be distinct integers in [0, 288)")
+-        if self.trellismx is not None:
++        if self.trellismx is not None and layer in self.trellismx.layers:
+             # The carrier omits the routed tensors its sidecars replace, so the sidecar
+             # payloads are the only source for this layer's experts.
+             if ids != tuple(range(288)):

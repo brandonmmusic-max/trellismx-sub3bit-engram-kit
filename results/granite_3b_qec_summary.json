@@ -1,0 +1,75 @@
+{
+  "model": "ibm-granite/granite-3.1-3b-a800m-instruct",
+  "architecture": {
+    "num_moe_layers": 32,
+    "num_experts": 40,
+    "top_k": 8,
+    "expert_weights": 3020000000
+  },
+  "evaluation": {
+    "windows": 21,
+    "tokens_per_window": 8192,
+    "positions": 172011,
+    "domains": 11,
+    "metric": "exact_fp64_kl_bf16_teacher_student",
+    "screen_13gram_max_overlap": 0.01
+  },
+  "per_expert_frontier_no_qec": [
+    {"bpw": 2.000, "config": "uniform_k2", "mean_kld": 0.2348, "median_kld": 0.0728, "p90_kld": 0.5954, "top1": 0.8228},
+    {"bpw": 2.125, "config": "per_expert_attribution", "mean_kld": 0.1359, "median_kld": 0.0400, "p90_kld": 0.3320, "top1": 0.8656},
+    {"bpw": 2.250, "config": "per_expert_attribution", "mean_kld": 0.1106, "median_kld": 0.0313, "p90_kld": 0.2673, "top1": 0.8783},
+    {"bpw": 2.250, "config": "per_layer_attribution", "mean_kld": 0.1390, "median_kld": 0.0408, "p90_kld": 0.3400, "top1": 0.8641},
+    {"bpw": 2.375, "config": "per_expert_attribution", "mean_kld": 0.0934, "median_kld": 0.0260, "p90_kld": 0.2180, "top1": 0.8889},
+    {"bpw": 2.500, "config": "uniform_p25", "mean_kld": 0.1015, "median_kld": 0.0278, "p90_kld": 0.2390, "top1": 0.8832},
+    {"bpw": 2.500, "config": "per_layer_attribution", "mean_kld": 0.0975, "median_kld": 0.0278, "p90_kld": 0.2340, "top1": 0.8850},
+    {"bpw": 2.500, "config": "per_expert_route_mass", "mean_kld": 0.0819, "median_kld": 0.0209, "p90_kld": 0.1870, "top1": 0.8965},
+    {"bpw": 2.500, "config": "per_expert_attribution", "mean_kld": 0.0799, "median_kld": 0.0222, "p90_kld": 0.1843, "top1": 0.8968},
+    {"bpw": 2.625, "config": "per_expert_attribution", "mean_kld": 0.0715, "median_kld": 0.0195, "p90_kld": 0.1630, "top1": 0.9035},
+    {"bpw": 2.750, "config": "per_expert_attribution", "mean_kld": 0.0632, "median_kld": 0.0175, "p90_kld": 0.1440, "top1": 0.9080},
+    {"bpw": 3.000, "config": "uniform_k3", "mean_kld": 0.0507, "median_kld": 0.0132, "p90_kld": 0.1163, "top1": 0.9171}
+  ],
+  "fullstack_qec_uniform_k2_50m": {
+    "stored_bpw": 2.000,
+    "equivalent_uniform_bpw": 2.347,
+    "free_bpw_gain": 0.347,
+    "engram_layers": [0, 1, 2, 4, 6, 8, 12, 16, 20, 24, 28, 31],
+    "engram_buckets": 262139,
+    "attn_lora_rank": 32,
+    "train_rmsnorms": true,
+    "train_expert_gains": true,
+    "train_routers": false,
+    "wall_minutes_4gpu_ddp": 24.2,
+    "throughput_tok_per_s": 35000,
+    "checkpoints": [
+      {"tokens": 0, "mean_kld": 0.2348, "median_kld": 0.0728, "p90_kld": 0.5954, "top1": 0.8228},
+      {"tokens": 1050000, "mean_kld": 0.1843, "median_kld": 0.0602, "p90_kld": 0.4581, "top1": 0.8441},
+      {"tokens": 5050000, "mean_kld": 0.1527, "median_kld": 0.0483, "p90_kld": 0.3808, "top1": 0.8582},
+      {"tokens": 10030000, "mean_kld": 0.1454, "median_kld": 0.0475, "p90_kld": 0.3617, "top1": 0.8604},
+      {"tokens": 20050000, "mean_kld": 0.1390, "median_kld": 0.0438, "p90_kld": 0.3494, "top1": 0.8645},
+      {"tokens": 35060000, "mean_kld": 0.1330, "median_kld": 0.0416, "p90_kld": 0.3341, "top1": 0.8677},
+      {"tokens": 49940000, "mean_kld": 0.1312, "median_kld": 0.0409, "p90_kld": 0.3309, "top1": 0.8693}
+    ]
+  },
+  "engram_only_10m_scale": [
+    {"base": "uniform_k2", "stored_bpw": 2.000, "kld_0m": 0.2348, "kld_1m": 0.1753, "kld_3m": 0.1636, "kld_5m": 0.1603, "kld_10m": 0.1544, "top1_10m": 0.8577},
+    {"base": "per_expert_225", "stored_bpw": 2.250, "kld_0m": 0.1106, "kld_1m": 0.1019, "kld_3m": 0.0991, "kld_5m": 0.0978, "kld_10m": 0.0951, "top1_10m": 0.8886},
+    {"base": "per_expert_250", "stored_bpw": 2.500, "kld_0m": 0.0799, "kld_1m": 0.0757, "kld_3m": 0.0751, "kld_5m": 0.0743, "kld_10m": 0.0720, "top1_10m": 0.9029}
+  ],
+  "pe225_5m_ablation": [
+    {"config": "baseline", "mean_kld": 0.1106, "median_kld": 0.0313, "p90_kld": 0.2673, "top1": 0.8783},
+    {"config": "unigram_only_8l", "mean_kld": 0.0978, "median_kld": 0.0287, "p90_kld": 0.2357, "top1": 0.8866},
+    {"config": "engram_8l", "mean_kld": 0.0978, "median_kld": 0.0290, "p90_kld": 0.2357, "top1": 0.8874},
+    {"config": "attn_lora_r16_only", "mean_kld": 0.0958, "median_kld": 0.0285, "p90_kld": 0.2343, "top1": 0.8876},
+    {"config": "engram_8l_plus_attn_lora_r16", "mean_kld": 0.0945, "median_kld": 0.0276, "p90_kld": 0.2329, "top1": 0.8890}
+  ],
+  "ngram_predictability_probe_bigram_r2": {
+    "0": 0.937,
+    "1": 0.687,
+    "2": 0.536,
+    "4": 0.330,
+    "8": 0.178,
+    "16": 0.074,
+    "24": 0.162,
+    "31": 0.246
+  }
+}

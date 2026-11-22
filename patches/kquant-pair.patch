@@ -1,0 +1,330 @@
+--- a/kquant/csrc/sqg_quantize.cpp
++++ b/kquant/csrc/sqg_quantize.cpp
+@@ -20,6 +20,15 @@
+     int64_t codebook,
+     int64_t tailbite_context);
+ 
++void quantize_tiles_pair_cuda(
++    at::Tensor input_tiles,
++    at::Tensor output_tiles,
++    at::Tensor output_symbols,
++    at::Tensor temp_costs,
++    at::Tensor temp_edges,
++    at::Tensor codebook,
++    int64_t tailbite_context);
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
+ {
+     module.def(
+@@ -30,4 +39,8 @@
+         "quantize_tiles_procedural",
+         &quantize_tiles_procedural_cuda,
+         "Quantize L16 tiles against an MCG or MUL1 control codebook");
++    module.def(
++        "quantize_tiles_pair",
++        &quantize_tiles_pair_cuda,
++        "Quantize L16 tiles with the 2.5-bit two-operand trellis");
+ }
+--- a/kquant/csrc/sqg_quantize.cu
++++ b/kquant/csrc/sqg_quantize.cu
+@@ -124,6 +124,163 @@
+ namespace
+ {
+ 
++__global__ __launch_bounds__(1024, 1) void quantize_pair_tiles_kernel(
++    const float* __restrict__ input_tiles_ptr,
++    float* __restrict__ output_tiles_ptr,
++    uint16_t* __restrict__ output_symbols_ptr,
++    float* __restrict__ temp_costs_ptr,
++    uint8_t* __restrict__ temp_edges_ptr,
++    int tailbite_context)
++{
++    constexpr int kStates = 65536;
++    constexpr int kPredecessors = 32;
++    constexpr int kSymbols = 128;
++    constexpr int kShift = 11;
++
++    extern __shared__ uint8_t pair_shared[];
++    float* input = reinterpret_cast<float*>(pair_shared);
++    float* min_values = reinterpret_cast<float*>(input + kSymbols * 2);
++    int* min_indices = reinterpret_cast<int*>(min_values + 32);
++
++    const int tile = blockIdx.x;
++    const int thread = threadIdx.x;
++    const float* input_tile = input_tiles_ptr + 256 * tile;
++    float* output_tile = output_tiles_ptr + 256 * tile;
++    uint16_t* output_symbols = output_symbols_ptr + kSymbols * tile;
++    uint8_t* decisions = temp_edges_ptr + kSymbols * kStates * tile;
++    float* costs = temp_costs_ptr + 2 * kStates * tile;
++    float* costs_inc = costs + kStates;
++
++    if (thread < 256) input[thread] = input_tile[thread];
++    __syncthreads();
++
++    const int warp = thread >> 5;
++    const int lane = thread & 31;
++    auto branch_cost = [&](int state, int symbol) {
++        const float first = __half2float(__ushort_as_half(
++            __nv_cvt_fp8_to_halfraw(sqg_e4m3_lut[state], __NV_E4M3).x));
++        const int mixed = (state * 1664525 + 1013904223) & 0xffff;
++        const float second = __half2float(__ushort_as_half(
++            __nv_cvt_fp8_to_halfraw(sqg_e4m3_lut[mixed], __NV_E4M3).x));
++        const float first_error = first - input[2 * symbol];
++        const float second_error = second - input[2 * symbol + 1];
++        return first_error * first_error + second_error * second_error;
++    };
++
++    auto forward = [&](int roll, int steps, int initial_state) {
++        float* current = costs;
++        float* next = costs_inc;
++        for (int state = thread; state < kStates; state += 1024) {
++            current[state] = initial_state < 0 || state == initial_state ? 0.0f : INFINITY;
++        }
++        __syncthreads();
++        for (int step = 0; step < steps; ++step) {
++            const int symbol = (step + roll) & (kSymbols - 1);
++            for (int state = thread; state < kStates; state += 1024) {
++                int best_predecessor = 0;
++                float best_cost = INFINITY;
++                const float emission_cost = branch_cost(state, symbol);
++                for (int predecessor = 0; predecessor < kPredecessors; ++predecessor) {
++                    const int previous = (predecessor << kShift) | (state >> 5);
++                    const float cost = current[previous] + emission_cost;
++                    if (cost < best_cost) {
++                        best_cost = cost;
++                        best_predecessor = predecessor;
++                    }
++                }
++                next[state] = best_cost;
++                decisions[symbol * kStates + state] = static_cast<uint8_t>(best_predecessor);
++            }
++            __syncthreads();
++            float* swap = current;
++            current = next;
++            next = swap;
++        }
++        return current;
++    };
++
++    float* primer_costs = forward(kSymbols - tailbite_context, 2 * tailbite_context, -1);
++    float local_min = INFINITY;
++    int local_index = -1;
++    for (int state = thread; state < kStates; state += 1024) {
++        if (primer_costs[state] < local_min) {
++            local_min = primer_costs[state];
++            local_index = state;
++        }
++    }
++    #pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        const float other_min = __shfl_down_sync(0xffffffff, local_min, offset);
++        const int other_index = __shfl_down_sync(0xffffffff, local_index, offset);
++        if (other_min < local_min) {
++            local_min = other_min;
++            local_index = other_index;
++        }
++    }
++    if (lane == 0) {
++        min_values[warp] = local_min;
++        min_indices[warp] = local_index;
++    }
++    __syncthreads();
++    int boundary_state = 0;
++    if (thread == 0) {
++        float best = min_values[0];
++        boundary_state = min_indices[0];
++        for (int index = 1; index < 32; ++index) {
++            if (min_values[index] < best) {
++                best = min_values[index];
++                boundary_state = min_indices[index];
++            }
++        }
++        int state = boundary_state;
++        int primer_symbols[kSymbols];
++        for (int step = 2 * tailbite_context - 1; step >= 0; --step) {
++            const int symbol = (step + kSymbols - tailbite_context) & (kSymbols - 1);
++            primer_symbols[step] = state & 31;
++            const int predecessor = decisions[symbol * kStates + state];
++            state = (predecessor << kShift) | (state >> 5);
++        }
++        int boundary_full = 0;
++        for (int step = 0; step < tailbite_context; ++step) {
++            boundary_full = ((boundary_full << 5) | primer_symbols[step]) & 0xffff;
++        }
++        boundary_state = boundary_full;
++    }
++    __syncthreads();
++    __shared__ int shared_boundary;
++    if (thread == 0) shared_boundary = boundary_state;
++    __syncthreads();
++
++    float* final_costs = forward(0, kSymbols, shared_boundary);
++    if (thread == 0) {
++        int state = shared_boundary;
++        if (state < 0 || state >= kStates) {
++            printf("pair invalid final state %d tile %d boundary %d\n", state, tile, shared_boundary);
++            output_symbols[0] = 0xffff;
++            return;
++        }
++        if (!isfinite(final_costs[state])) {
++            printf("pair unreachable boundary %d tile %d\n", state, tile);
++            output_symbols[0] = 0xffff;
++            return;
++        }
++        for (int symbol = kSymbols - 1; symbol >= 0; --symbol) {
++            const int predecessor = decisions[symbol * kStates + state];
++            const int previous = (predecessor << kShift) | (state >> 5);
++            const int encoded = state;
++            output_symbols[symbol] = static_cast<uint16_t>(encoded & 31);
++            const float first = __half2float(__ushort_as_half(
++                __nv_cvt_fp8_to_halfraw(sqg_e4m3_lut[encoded], __NV_E4M3).x));
++            const int mixed = (encoded * 1664525 + 1013904223) & 0xffff;
++            const float second = __half2float(__ushort_as_half(
++                __nv_cvt_fp8_to_halfraw(sqg_e4m3_lut[mixed], __NV_E4M3).x));
++            output_tile[2 * symbol] = first;
++            output_tile[2 * symbol + 1] = second;
++            state = previous;
++        }
++    }
++}
++
+ template <int K, int codebook>
+ void launch_trellis(
+     const float* input,
+@@ -160,8 +317,87 @@
+     }
+ }
+ 
++void launch_pair_trellis(
++    const float* input,
++    float* output,
++    uint16_t* symbols,
++    float* costs,
++    uint8_t* edges,
++    int tiles,
++    int tailbite_context,
++    cudaStream_t stream)
++{
++    const int shared_memory = 256 * static_cast<int>(sizeof(float))
++        + 32 * static_cast<int>(sizeof(float))
++        + 32 * static_cast<int>(sizeof(int))
++        + sizeof(int);
++    quantize_pair_tiles_kernel<<<tiles, 1024, shared_memory, stream>>>(
++        input,
++        output,
++        symbols,
++        costs,
++        edges,
++        tailbite_context);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ }  // namespace
+ 
++void quantize_tiles_pair_cuda(
++    at::Tensor input_tiles,
++    at::Tensor output_tiles,
++    at::Tensor output_symbols,
++    at::Tensor temp_costs,
++    at::Tensor temp_edges,
++    at::Tensor codebook,
++    int64_t tailbite_context)
++{
++    const at::cuda::OptionalCUDAGuard guard(input_tiles.device());
++    const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    TORCH_CHECK(input_tiles.is_cuda(), "input_tiles must be CUDA");
++    TORCH_CHECK(input_tiles.scalar_type() == at::kFloat, "input_tiles must be FP32");
++    TORCH_CHECK(input_tiles.dim() == 2 && input_tiles.size(1) == 256,
++                "input_tiles must have shape [tiles, 256]");
++    TORCH_CHECK(output_tiles.sizes() == input_tiles.sizes(),
++                "output_tiles shape mismatch");
++    TORCH_CHECK(output_tiles.scalar_type() == at::kFloat,
++                "output_tiles must be FP32");
++    TORCH_CHECK(output_symbols.dim() == 2 && output_symbols.size(0) == input_tiles.size(0)
++                    && output_symbols.size(1) == 128,
++                "output_symbols must have shape [tiles, 128]");
++    TORCH_CHECK(output_symbols.scalar_type() == at::kShort,
++                "output_symbols must be int16");
++    TORCH_CHECK(temp_edges.scalar_type() == at::kByte && temp_edges.dim() == 3,
++                "temp_edges must be rank-3 uint8");
++    TORCH_CHECK(temp_costs.scalar_type() == at::kFloat && temp_costs.dim() == 3,
++                "temp_costs must be rank-3 FP32");
++    TORCH_CHECK(temp_costs.size(0) >= input_tiles.size(0) && temp_costs.size(1) == 2
++                    && temp_costs.size(2) == 65536,
++                "temp_costs shape mismatch");
++    TORCH_CHECK(temp_edges.size(0) >= input_tiles.size(0) && temp_edges.size(1) == 128
++                    && temp_edges.size(2) == 65536,
++                "temp_edges shape mismatch");
++    TORCH_CHECK(codebook.device() == input_tiles.device()
++                    && codebook.scalar_type() == at::kByte && codebook.numel() == 65536,
++                "codebook must be 65,536 CUDA uint8 labels");
++    TORCH_CHECK(tailbite_context >= 1 && tailbite_context <= 128,
++                "tailbite_context must be in 1..128");
++    const int tiles = static_cast<int>(input_tiles.size(0));
++    if (!tiles) return;
++    const void* table = codebook.data_ptr<uint8_t>();
++    C10_CUDA_CHECK(cudaMemcpyToSymbolAsync(
++        sqg_e4m3_lut, &table, sizeof(table), 0, cudaMemcpyHostToDevice, stream));
++    launch_pair_trellis(
++        input_tiles.data_ptr<float>(),
++        output_tiles.data_ptr<float>(),
++        reinterpret_cast<uint16_t*>(output_symbols.data_ptr<int16_t>()),
++        temp_costs.data_ptr<float>(),
++        temp_edges.data_ptr<uint8_t>(),
++        tiles,
++        static_cast<int>(tailbite_context),
++        stream);
++}
++
+ void quantize_tiles_sqg_cuda(
+     at::Tensor input_tiles,
+     at::Tensor output_tiles,
+--- a/kquant/sqg_quantizer.py
++++ b/kquant/sqg_quantizer.py
+@@ -158,6 +158,46 @@
+     return costs, traceback
+ 
+ 
++def _pair_temp_buffers(device: torch.device, tiles: int):
++    batch = max(256, tiles)
++    costs = torch.empty((batch, 2, 65536), dtype=torch.float32, device=device)
++    traceback = torch.empty((batch, 128, 65536), dtype=torch.uint8, device=device)
++    return costs, traceback
++
++
++def quantize_pair_tiles(
++    tiles: torch.Tensor,
++    codebook: torch.Tensor,
++    *,
++    tailbite_context: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Search 2.5-bit tiles and return values and 5-bit branch symbols."""
++    if tiles.ndim != 2 or tiles.shape[1] != 256 or tiles.dtype != torch.float32:
++        raise ValueError("pair tiles must be FP32 with shape [N, 256]")
++    if tiles.device.type != "cuda":
++        raise ValueError("pair tiles must be CUDA tensors")
++    if codebook.dtype != torch.uint8 or codebook.numel() != 65536:
++        raise ValueError("pair codebook must contain 65,536 uint8 labels")
++    if codebook.device != tiles.device:
++        raise ValueError("pair codebook and tiles must use the same CUDA device")
++    tiles = tiles.contiguous()
++    output = torch.empty_like(tiles)
++    symbols = torch.empty((tiles.shape[0], 128), dtype=torch.int16, device=tiles.device)
++    costs, traceback = _pair_temp_buffers(tiles.device, tiles.shape[0])
++    _extension().quantize_tiles_pair(
++        tiles,
++        output,
++        symbols,
++        costs,
++        traceback,
++        codebook,
++        int(tailbite_context),
++    )
++    if bool((symbols & ~31).any()):
++        raise RuntimeError("pair trellis failed its closed-state check")
++    return output, symbols
++
++
+ def install_sqg_quantizer(quantizer_module) -> None:
+     """Teach a loaded EXL encoder module to consume ``sqg_e4m3_lut``.
+ 
