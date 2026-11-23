@@ -403,88 +403,103 @@ def evaluate_dense_dir(
         grouped.setdefault(split, []).append(p)
 
     results: dict[str, dict[str, object]] = {}
-    for split, split_paths in grouped.items():
-        klds: list[torch.Tensor] = []
-        agrees: list[torch.Tensor] = []
-        t_lps: list[torch.Tensor] = []
-        s_lps: list[torch.Tensor] = []
-        t_hits: list[torch.Tensor] = []
-        self_checked = False
-        for p in split_paths:
-            rec = None
-            if is_writer or not dist.is_initialized():
-                rec = torch.load(p, map_location="cpu", weights_only=True)
-                token_ids = rec["token_ids"]
-            else:
-                token_ids = None
-            if dist.is_initialized():
-                obj = [token_ids]
-                dist.broadcast_object_list(obj, src=0)
-                token_ids = obj[0]
-            assert token_ids is not None
-            ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-            out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
-            if is_writer:
-                assert rec is not None
-                s_logits = out_logits.cpu()
-                t_logits = rec["logits"]
-                if self_check and not self_checked:
-                    self_kld, _ = tokenwise_kld_fp64(t_logits, t_logits, vocab_limit=vocab_limit)
-                    if float(self_kld.max().item()) != 0.0:
-                        raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
-                    self_checked = True
-                kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
-                    t_logits, s_logits, token_ids[1:], vocab_limit=vocab_limit
+    orig_threads = torch.get_num_threads()
+    if is_writer:
+        eval_threads = min(64, max(orig_threads, (os.cpu_count() or 16) // 2))
+        torch.set_num_threads(eval_threads)
+    try:
+        for split, split_paths in grouped.items():
+            t_split = time.time()
+            klds: list[torch.Tensor] = []
+            agrees: list[torch.Tensor] = []
+            t_lps: list[torch.Tensor] = []
+            s_lps: list[torch.Tensor] = []
+            t_hits: list[torch.Tensor] = []
+            self_checked = False
+            for p in split_paths:
+                rec = None
+                if is_writer or not dist.is_initialized():
+                    rec = torch.load(p, map_location="cpu", weights_only=True)
+                    token_ids = rec["token_ids"]
+                else:
+                    token_ids = None
+                if dist.is_initialized():
+                    obj = [token_ids]
+                    dist.broadcast_object_list(obj, src=0)
+                    token_ids = obj[0]
+                assert token_ids is not None
+                ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
+                out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
+                if is_writer:
+                    assert rec is not None
+                    s_logits = out_logits.cpu()
+                    t_logits = rec["logits"]
+                    if self_check and not self_checked:
+                        self_kld, _ = tokenwise_kld_fp64(t_logits, t_logits, vocab_limit=vocab_limit)
+                        if float(self_kld.max().item()) != 0.0:
+                            raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
+                        self_checked = True
+                    kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
+                        t_logits, s_logits, token_ids[1:], vocab_limit=vocab_limit
+                    )
+                    klds.append(kld)
+                    agrees.append(agree)
+                    t_lps.append(t_lp)
+                    s_lps.append(s_lp)
+                    t_hits.append(hit)
+                    del s_logits, t_logits
+                del ids, out_logits, rec
+            if is_writer and klds:
+                summ = summarize_windows(
+                    klds,
+                    agrees,
+                    window_teacher_logp=t_lps,
+                    window_student_logp=s_lps,
+                    window_teacher_hits=t_hits,
+                    resamples=resamples,
                 )
-                klds.append(kld)
-                agrees.append(agree)
-                t_lps.append(t_lp)
-                s_lps.append(s_lp)
-                t_hits.append(hit)
-                del s_logits, t_logits
-            del ids, out_logits, rec
-        if is_writer and klds:
-            summ = summarize_windows(
-                klds,
-                agrees,
-                window_teacher_logp=t_lps,
-                window_student_logp=s_lps,
-                window_teacher_hits=t_hits,
-                resamples=resamples,
-            )
-            align_ok = (
-                True
-                if summ.realized_alignment_rate is None
-                else (ALIGNMENT_BAND[0] <= summ.realized_alignment_rate <= ALIGNMENT_BAND[1])
-            )
-            if not align_ok:
-                msg = (
-                    f"realized-token alignment {summ.realized_alignment_rate:.4f} outside "
-                    f"allowed band {ALIGNMENT_BAND} on split {split}"
+                align_ok = (
+                    True
+                    if summ.realized_alignment_rate is None
+                    else (ALIGNMENT_BAND[0] <= summ.realized_alignment_rate <= ALIGNMENT_BAND[1])
                 )
-                if strict_alignment:
-                    raise RuntimeError(msg)
-                print(f"[WARN] {msg}", flush=True)
-            results[split] = {
-                "windows": summ.windows,
-                "positions": summ.positions,
-                "mean_kld": summ.mean_kld,
-                "median_kld": summ.median_kld,
-                "p90_kld": summ.p90_kld,
-                "p99_kld": summ.p99_kld,
-                "p99_9_kld": summ.p99_9_kld,
-                "max_kld": summ.max_kld,
-                "ci95_low": summ.ci95_low,
-                "ci95_high": summ.ci95_high,
-                "percentile_ci95_low": summ.percentile_ci95_low,
-                "percentile_ci95_high": summ.percentile_ci95_high,
-                "top1_agreement_pct": summ.top1_agreement_pct,
-                "top1_wilson95_low_pct": summ.top1_wilson95_low_pct,
-                "top1_wilson95_high_pct": summ.top1_wilson95_high_pct,
-                "perplexity_ratio": summ.perplexity_ratio,
-                "realized_alignment_rate": summ.realized_alignment_rate,
-                "alignment_ok": align_ok,
-            }
+                if not align_ok:
+                    msg = (
+                        f"realized-token alignment {summ.realized_alignment_rate:.4f} outside "
+                        f"allowed band {ALIGNMENT_BAND} on split {split}"
+                    )
+                    if strict_alignment:
+                        raise RuntimeError(msg)
+                    print(f"[WARN] {msg}", flush=True)
+                results[split] = {
+                    "windows": summ.windows,
+                    "positions": summ.positions,
+                    "mean_kld": summ.mean_kld,
+                    "median_kld": summ.median_kld,
+                    "p90_kld": summ.p90_kld,
+                    "p99_kld": summ.p99_kld,
+                    "p99_9_kld": summ.p99_9_kld,
+                    "max_kld": summ.max_kld,
+                    "ci95_low": summ.ci95_low,
+                    "ci95_high": summ.ci95_high,
+                    "percentile_ci95_low": summ.percentile_ci95_low,
+                    "percentile_ci95_high": summ.percentile_ci95_high,
+                    "top1_agreement_pct": summ.top1_agreement_pct,
+                    "top1_wilson95_low_pct": summ.top1_wilson95_low_pct,
+                    "top1_wilson95_high_pct": summ.top1_wilson95_high_pct,
+                    "perplexity_ratio": summ.perplexity_ratio,
+                    "realized_alignment_rate": summ.realized_alignment_rate,
+                    "alignment_ok": align_ok,
+                }
+                print(
+                    f"[eval-split] {split} ({summ.windows}w, {summ.positions}p): "
+                    f"mean_kld={summ.mean_kld:.5f} top1={summ.top1_agreement_pct:.2f}% "
+                    f"align={summ.realized_alignment_rate:.4f} t={time.time()-t_split:.1f}s",
+                    flush=True,
+                )
+    finally:
+        if is_writer:
+            torch.set_num_threads(orig_threads)
     if was_training:
         eval_model.train()
     return results
