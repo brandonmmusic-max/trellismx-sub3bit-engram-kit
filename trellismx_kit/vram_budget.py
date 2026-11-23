@@ -1,7 +1,7 @@
 """Exact GPU VRAM and host-RAM sizing calculator for any MoE ModelProfile.
 
 Explicitly separates on-disk CSF scale compression (~0.06 bpw) from in-VRAM
-UE8M0/K32 scale expansion (0.25 bpw in the current b12x runtime unless in-VRAM
+UE8M0/K32 scale expansion (0.25 bpw in the b12x runtime unless in-VRAM
 CSF decode is enabled), keeps lm_head resident in GPU VRAM, charges replicated
 projections per GPU, and accounts for MTP routed layers when requested.
 """

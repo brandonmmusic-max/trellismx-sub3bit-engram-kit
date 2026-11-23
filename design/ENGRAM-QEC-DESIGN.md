@@ -55,7 +55,7 @@ divergence on a leak-free 80/20 short-to-long text stream:
      Layer 0 GPU compute).
 
 Empirical ablation note: adding a dense rank-64 shared-basis Wiener matrix or
-Stage-1 hidden-state MSE alignment hurt held-out KLD on Granite 3.1 3B relative
+hidden-state MSE pre-alignment hurt held-out KLD on Granite 3.1 3B relative
 to the leaner stack above and is excluded from the canonical recipe.
 
 ## Context-length curriculum (80/20 short-to-long split)

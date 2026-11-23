@@ -3,6 +3,8 @@
 Model-neutral toolkit, format specifications, kernel patches, and empirical KLD
 benchmarks for compressing large Mixture-of-Experts (MoE) language models below
 3 bits per routed-expert weight without expert weight offloading to host RAM.
+GLM-5.3-Flash targets are quantized directly from `zai-org/GLM-5.3-Flash-BF16`,
+with non-routed modules kept in BF16 as stored.
 
 Target deployment envelope: fitting 1T+ parameter MoE checkpoints onto four
 96 GB GPUs (382 GiB VRAM) with 512 GB host DDR5 while preserving decode speed.

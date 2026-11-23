@@ -2692,7 +2692,7 @@ diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' ref/b12x-trellismx/b12x/moe/
 +                    "world_size": str(self.world_size),
 +                    "alphabet": "e4m3",
 +                    "scale": "ue8m0-k32",
-+                    "law": "procedural-mcg-alpha2",
++                    "law": "procedural-npk",
 +                    "ldlq": "false",
 +                    "pair_mix_multiplier": str(PAIR_MIX_MULTIPLIER),
 +                    "pair_mix_increment": str(PAIR_MIX_INCREMENT),

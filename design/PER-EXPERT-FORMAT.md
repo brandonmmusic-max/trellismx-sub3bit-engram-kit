@@ -53,9 +53,9 @@ and `E_r` be the count of experts assigned to rate `r` in the layer.
 ## Lossless CSF scale planes
 
 When `scale_storage = csf`, the writer compresses each UE8M0 plane into a
-per-row median base, 1-bit offset bitplane, and exact exception list, then
-expands it immediately and verifies bitwise equality before writing. The
-metadata records `sha256_w13_scale_ue8m0` and `sha256_w2_scale_ue8m0` of the
+per-row optimal adjacent-pair `[b, b + 1]` base (`_optimal_pair_base`), 1-bit
+offset bitplane, and exact exception list, then expands it immediately and
+verifies bitwise equality before writing. The metadata records `sha256_w13_scale_ue8m0` and `sha256_w2_scale_ue8m0` of the
 plain planes. The reader verifies every stored tensor hash, expands CSF planes,
 and verifies the expanded bytes against the plain-plane hashes.
 

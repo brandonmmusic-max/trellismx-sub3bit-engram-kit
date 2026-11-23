@@ -11,8 +11,8 @@ Lower KLD and higher Top-1 agreement are better.
 
 ## 1. Per-expert TrellisMX baseline frontier (no QEC)
 
-Standard local GPTQ rounding, weights-only path (from
-`trellismx-sub3bit-per-expert-results`):
+Standard local GPTQ rounding, weights-only path (recorded in the companion
+private benchmark repository `brandonmmusic-max/trellismx-sub3bit-per-expert-results`):
 
 | Stored bits | Configuration | Mean KLD | Median | p90 | Top-1 |
 |---:|---|---:|---:|---:|---:|

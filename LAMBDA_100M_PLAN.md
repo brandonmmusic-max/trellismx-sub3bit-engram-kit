@@ -40,7 +40,7 @@ Recommended quantization arm for the DGX Spark near-4-bit target:
    10.5 GiB FP8/text-only carrier (16 to 18 GiB left for OS + KV cache), or
    **108.6 GiB** in EXL3/TR3 with the untouched 18.0 GiB multimodal carrier.
 2. **Expanded-scale fallback arm: Per-Expert 2.25 to 2.375 bpw** if keeping
-   both the untouched 18.0 GiB multimodal carrier and current expanded 0.25 bpw
+   both the untouched 18.0 GiB multimodal carrier and expanded 0.25 bpw
    UE8M0 scales in VRAM (**108.3 GiB** at 2.25 bpw).
 
 ## 2. 100M-token 80/20 corpus and evaluation split
@@ -50,7 +50,7 @@ against every evaluation window before uploading to the node:
 
 | Split | Sequence length | Count | Supervised positions | Storage format | Approx. size |
 |---|---:|---:|---:|---|---:|
-| `eval_2k` (anchor) | 2,048 | 25 | 51,175 | Dense FP32/BF16 (reusable from existing K4 panel) | 15.5–31.0 GiB |
+| `eval_2k` (anchor) | 2,048 | 25 | 51,175 | Dense FP32/BF16 (reusable from sealed `roles-v5` final panel) | 15.5 to 31.0 GiB |
 | `eval_8k` (multi-domain) | 8,192 | 21 | 172,011 | Dense BF16 (`eval_dense/`) | 53.3 GiB |
 | `eval_32k` (long-context) | 32,768 | 4 | 131,068 | Dense BF16 (`eval_dense/`) | 40.6 GiB |
 | `train_short` (80%) | 4,096 | 19,536 | 80,000,000 | Sparse top-128 (`top_logp` fp16 + `p_tail`/`lse` fp32) | 62.4 GB |
@@ -96,9 +96,8 @@ Verify shard counts, zero NaN/Inf values, and exact `eval_dense/` shapes, then
 
 ### Step 2: 100M-token Dual-Trellis QEC v2 distillation (~1.5 to 2.5 hr)
 
-With the BF16 teacher unloaded, run TP4 student training (or 2x TP4 DDP replicas
-across the 8 GPUs) from the local NVMe sparse top-128 shards using the winning
-Dual-Trellis QEC v2 stack:
+With the BF16 teacher unloaded, run EP8/DP8 student training from the local
+NVMe sparse top-128 shards using the Dual-Trellis QEC v2 stack:
 
 1. Permanently frozen: all quantized routed MoE trellis streams, all routers,
    all sparse attention indexers (`index_topk = 2048`), and any vision tower

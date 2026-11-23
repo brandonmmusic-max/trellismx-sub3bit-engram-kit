@@ -360,7 +360,7 @@ def test_layer_sensitivity_3d_and_2d_logits() -> None:
 def test_engram_probe_large_vocab_int32_kld_inf_mask_and_vram_budget() -> None:
     rng = np.random.default_rng(5)
     n = 1000
-    # int32 IDs above 46,340 previously overflowed in NumPy 2.x!
+    # High vocab IDs (> 46,340) verify int64 hash arithmetic avoids int32 overflow in NumPy 2.x.
     toks = (rng.integers(0, 20, size=n, dtype=np.int32) + np.int32(150_000))
     prev = np.concatenate([np.array([149_999], dtype=np.int32), toks[:-1]])
     table = torch.randn(20, 32)
