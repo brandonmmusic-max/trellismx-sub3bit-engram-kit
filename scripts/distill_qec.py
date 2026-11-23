@@ -818,7 +818,11 @@ def main() -> None:
                     buf.copy_(buf_gpu.cpu())
 
     _sync_ep_qec_params()
-    opt = torch.optim.AdamW(param_groups)
+    all_cuda = bool(trainable_params) and all(p.is_cuda for p in trainable_params)
+    try:
+        opt = torch.optim.AdamW(param_groups, fused=all_cuda)
+    except (TypeError, RuntimeError):
+        opt = torch.optim.AdamW(param_groups)
 
     short_chunks_per_step = dp_world * args.batch_size * args.grad_accum
     long_chunks_per_step = dp_world * args.long_batch_size * args.long_grad_accum
@@ -1033,7 +1037,7 @@ def main() -> None:
 
         seen = short_tokens_seen + long_tokens_seen
         seen_m = seen / 1e6
-        if is_writer and (step == 0 or (step + 1) % 25 == 0 or step + 1 == total_steps):
+        if is_writer and (step == 0 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
             print(
                 f"step={step+1}/{total_steps} split={phase} positions={seen_m:.2f}M "
                 f"(short={short_tokens_seen/1e6:.2f}M long={long_tokens_seen/1e6:.2f}M) "

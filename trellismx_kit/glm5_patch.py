@@ -310,6 +310,30 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
             tp_mesh=tp1_mesh,
             ep_implementation="all_to_all",
         )
+        ep_fwd = mod.forward
+
+        def _make_chunked_ep_dispatch(fn, max_tokens: int = 8192):
+            def _chunked_ep(
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ):
+                n_tok = int(hidden_states.shape[0])
+                if n_tok <= max_tokens:
+                    return fn(hidden_states, top_k_index, top_k_weights)
+                parts = [
+                    fn(
+                        hidden_states[i : i + max_tokens],
+                        top_k_index[i : i + max_tokens],
+                        top_k_weights[i : i + max_tokens],
+                    )
+                    for i in range(0, n_tok, max_tokens)
+                ]
+                return torch.cat(parts, dim=0)
+
+            return _chunked_ep
+
+        mod.forward = _make_chunked_ep_dispatch(ep_fwd, max_tokens=8192)  # type: ignore[method-assign]
         patched += 1
     # Verify no non-expert parameter (especially lm_head or embed_tokens) remained TP-sharded.
     for pname, param in model.named_parameters():
