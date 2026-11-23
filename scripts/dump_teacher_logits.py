@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from trellismx_kit.glm5_patch import patch_glm5_long_context
+from trellismx_kit.glm5_patch import patch_ep_dp_all_to_all, patch_glm5_long_context
 
 try:
     from transformers import AutoModelForImageTextToText
@@ -99,34 +99,21 @@ def load_hf_model(
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
 
-        # Keep pure EP on experts only; avoids upstream hybrid linear_attention o_proj TP mismatch
-        # and avoids FSDP sharding overhead on replicated non-expert layers under all_to_all DP+EP.
+        # Keep pure EP on experts only (no FSDP2 over mixed BF16/FP32 dense/mHC params,
+        # no TP over hybrid linear_attention o_proj). When ep_implementation == "all_to_all",
+        # patch_ep_dp_all_to_all converts the loaded EP modules to DP+EP AllToAllEP.
         cfg.base_model_tp_plan = None
         if hasattr(cfg, "text_config") and cfg.text_config is not None:
             cfg.text_config.base_model_tp_plan = None
-        if ep_implementation == "all_to_all":
-            cfg.base_model_fsdp_plan = None
-            if hasattr(cfg, "text_config") and cfg.text_config is not None:
-                cfg.text_config.base_model_fsdp_plan = None
         kwargs["config"] = cfg
         try:
-            if ep_implementation == "all_to_all":
-                kwargs["distributed_config"] = DistributedConfig(
-                    ep_size=world_size,
-                    tp_size=1,
-                    fsdp_size=world_size,
-                    fsdp_plan={},
-                    pp_size=1,
-                    ep_implementation="all_to_all",
-                )
-            else:
-                kwargs["distributed_config"] = DistributedConfig(
-                    ep_size=world_size,
-                    tp_size=world_size,
-                    fsdp_size=1,
-                    pp_size=1,
-                    ep_implementation="all_reduce",
-                )
+            kwargs["distributed_config"] = DistributedConfig(
+                ep_size=world_size,
+                tp_size=world_size,
+                fsdp_size=1,
+                pp_size=1,
+                ep_implementation="all_reduce",
+            )
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
@@ -139,6 +126,10 @@ def load_hf_model(
 
     model = loader.from_pretrained(model_path, **kwargs).eval()
     patch_glm5_long_context(model)
+    if distributed_ep and world_size > 1 and ep_implementation == "all_to_all":
+        n_ep = patch_ep_dp_all_to_all(model)
+        if n_ep == 0:
+            raise RuntimeError("ep_implementation='all_to_all' requested but zero EP expert modules were patched")
     return model
 
 

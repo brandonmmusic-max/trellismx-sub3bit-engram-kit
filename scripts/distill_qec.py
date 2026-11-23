@@ -41,7 +41,7 @@ from trellismx_kit.engram_qec import (
     build_nfkc_canon_map,
     topk_kl_loss,
 )
-from trellismx_kit.glm5_patch import patch_glm5_long_context
+from trellismx_kit.glm5_patch import patch_ep_dp_all_to_all, patch_glm5_long_context
 from trellismx_kit.kld_score import (
     ALIGNMENT_BAND,
     summarize_windows,
@@ -238,29 +238,15 @@ def _load_model(
         cfg.base_model_tp_plan = None
         if hasattr(cfg, "text_config") and cfg.text_config is not None:
             cfg.text_config.base_model_tp_plan = None
-        if ep_implementation == "all_to_all":
-            cfg.base_model_fsdp_plan = None
-            if hasattr(cfg, "text_config") and cfg.text_config is not None:
-                cfg.text_config.base_model_fsdp_plan = None
         kwargs["config"] = cfg
         try:
-            if ep_implementation == "all_to_all":
-                kwargs["distributed_config"] = DistributedConfig(
-                    ep_size=world_size,
-                    tp_size=1,
-                    fsdp_size=world_size,
-                    fsdp_plan={},
-                    pp_size=1,
-                    ep_implementation="all_to_all",
-                )
-            else:
-                kwargs["distributed_config"] = DistributedConfig(
-                    ep_size=world_size,
-                    tp_size=world_size,
-                    fsdp_size=1,
-                    pp_size=1,
-                    ep_implementation="all_reduce",
-                )
+            kwargs["distributed_config"] = DistributedConfig(
+                ep_size=world_size,
+                tp_size=world_size,
+                fsdp_size=1,
+                pp_size=1,
+                ep_implementation="all_reduce",
+            )
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
@@ -270,6 +256,10 @@ def _load_model(
             )
         model = loader.from_pretrained(model_path, **kwargs)
         patch_glm5_long_context(model)
+        if ep_implementation == "all_to_all":
+            n_ep = patch_ep_dp_all_to_all(model)
+            if n_ep == 0:
+                raise RuntimeError("ep_implementation='all_to_all' requested but zero EP expert modules were patched")
         return model
     if device_map_auto:
         kwargs["device_map"] = "auto"

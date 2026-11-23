@@ -244,6 +244,61 @@ def patch_glm5_fla_causal_conv1d() -> bool:
     return True
 
 
+def patch_ep_dp_all_to_all(model: nn.Module) -> int:
+    """Switch all_reduce EP experts to DP+EP all_to_all without wrapping the model in FSDP2.
+
+    Loads keep pure replicated non-expert weights (supporting mixed BF16/FP32 parameters
+    such as Glm5Next hyper-connections and router biases) while converting every
+    ``EpDispatchExpertsParallel`` module to ``AllToAllEP`` with ``tp_mesh.size() == 1``
+    so each rank processes an independent data-parallel batch in parallel.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from transformers.distributed.expert_parallel import (
+        AllToAllEP,
+        EPImplementation,
+        EpDispatchExpertsParallel,
+    )
+
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return 0
+
+    world_size = dist.get_world_size()
+    tp1_mesh = init_device_mesh("cuda", (world_size, 1), mesh_dim_names=("dp", "tp"))["tp"]
+    patched = 0
+    for mod in model.modules():
+        fwd = getattr(mod, "forward", None)
+        closure = getattr(fwd, "__closure__", None)
+        if not closure:
+            continue
+        orig_impl = None
+        orig_parallel = None
+        for cell in closure:
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val, EPImplementation):
+                orig_impl = val
+            elif isinstance(val, EpDispatchExpertsParallel):
+                orig_parallel = val
+        if orig_impl is None:
+            continue
+        if isinstance(orig_impl, AllToAllEP) and orig_impl.tp_mesh.size() == 1:
+            patched += 1
+            continue
+        mod.forward = orig_impl.experts_forward  # type: ignore[method-assign]
+        parallel = orig_parallel if orig_parallel is not None else EpDispatchExpertsParallel()
+        parallel.install_forward(
+            mod,
+            orig_impl.ep_mesh,
+            tp_mesh=tp1_mesh,
+            ep_implementation="all_to_all",
+        )
+        patched += 1
+    return patched
+
+
 def patch_glm5_long_context(
     model: nn.Module,
     *,
