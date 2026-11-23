@@ -662,7 +662,13 @@ Rigorous interpretation of all results requires six explicit caveats:
 
 ---
 
-## 7. Lineage, Related Work, and Third-Party Credits
+## 7. Acknowledgments, Lineage, Related Work, and Third-Party Credits
+
+### 7.1 Compute Sponsorship and Acknowledgments
+
+Sincere gratitude is extended to **Lambda Labs** for generously sponsoring and donating the 8x NVIDIA B200 GPU compute that powered this work. The GLM-5.3-Flash scale experiments, including calibration capture, four-rate per-expert quantization of `304.41B` routed parameters, generation and public archival of the `646.975 GiB` 100.1M-token BF16 teacher-logit dataset, and the 100M-token Dual-Trellis QEC distillation and exact FP64 KLD qualification campaign, would not have been possible without Lambda Labs' compute sponsorship.
+
+### 7.2 Author Disclosure and Upstream Attribution
 
 **Author Disclosure:** Brandon M. Music is the author of this paper, the founder and license author of Local Inference Lab, and the author of the `procedural-npk` codec law and `ShapleyMCG` allocation framework.
 
@@ -672,7 +678,7 @@ Table 7.1 provides specific attribution to every upstream research paper, softwa
 |---|---|---|
 | **GLM-5.3-Flash Base Model** | Z.ai (`zai-org/GLM-5.3-Flash-BF16`) | Unmodified BF16 source checkpoint (`304.41B` routed + `9.67B` non-routed; hybrid 34 KDA / 11 MLA-NoPE + DSA + 4-stream mHC). All GLM-5.3-Flash TrellisMX artifacts (including the P8 K4/K5 precedent and the `2.375` / `2.500` bpw releases) are quantized directly from this BF16 checkpoint. |
 | **Granite 3.1 3B Validation Model** | IBM (`ibm-granite/granite-3.1-3b-a800m-instruct`, Apache-2.0) | 32-layer, 40-expert MoE qualification model used for the training-free frontier, YAQA negative controls, 50M-token v1 scaling curve, and 10M-token Dual-Trellis QEC v2 ablation suite. |
-| **Compute Infrastructure** | Lambda | 8x NVIDIA B200 GPU compute powering GLM-5.3-Flash quantization, teacher-logit archiving, and the active 100M-token QEC distillation campaign. |
+| **Donated Compute Infrastructure** | **Lambda Labs** | Generously donated 8x NVIDIA B200 GPU compute powering GLM-5.3-Flash calibration, four-rate quantization, public 100.1M-token teacher-logit archiving, and the 100M-token Dual-Trellis QEC distillation campaign. |
 | **vLLM Serving Image** | Local Inference Lab and Luke Alonso | Containerized vLLM serving image lineage (`ghcr.io/local-inference-lab/vllm`, Apache-2.0). |
 | **CSF Scale Encoder/Decoder & FP64 KLD Protocol** | Local Inference Lab (CSF first added by Martin Vit, updated by Luke Alonso) | Lossless Compressed Sparse Format (CSF) UE8M0 scale codec design and the sealed exact IEEE-754 FP64 full-vocabulary KLD evaluation protocol. |
 | **`b12x` Kernel Suite** | Luke Alonso (`github.com/lukealonso/b12x`), with Martin Vit and Local Inference Lab contributors (Apache-2.0) | SM120 Blackwell CUDA/CuTe P8 fused MoE and trellis kernels extended by `patches/b12x-per-expert.patch` for four-rate `{k2, p25, k3, k4}` per-expert dispatch. |

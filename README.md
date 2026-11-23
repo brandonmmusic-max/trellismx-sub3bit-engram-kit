@@ -77,7 +77,11 @@ pytest -v tests/test_kit.py
 python3 -m trellismx_kit.vram_budget --profile configs/template-1t-moe.json --avg-expert-bits 2.25 --gpus 4
 ```
 
-## Credits and precedents
+## Acknowledgments and credits
+
+Sincere thanks to **Lambda Labs** for generously donating the 8x NVIDIA B200 GPU
+compute that powered the GLM-5.3-Flash quantization, 100.1M-token BF16
+teacher-logit archive, and 100M-token Dual-Trellis QEC distillation experiments.
 
 Built on prior open research and software: IBM Granite 3.1 3B-A800M-Instruct
 (test model), NVIDIA Nemotron and Nebius SWE-agent datasets (calibration and
