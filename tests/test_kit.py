@@ -80,7 +80,8 @@ def test_shipped_profiles_validate() -> None:
         assert prof.total_routed_weights > 0
     glm = load_profile(REPO_ROOT / "configs" / "glm-5.3-flash.json")
     assert glm.layer_path_template == "model.language_model.layers.{layer}"
-    assert "q_a_proj" in glm.projections_for_layer(3)
+    assert "q_b_proj" in glm.projections_for_layer(3)
+    assert "q_a_proj" not in glm.projections_for_layer(3)
     assert "q_proj" in glm.projections_for_layer(4)
 
 
