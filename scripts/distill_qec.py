@@ -432,22 +432,30 @@ def evaluate_dense_dir(
                 out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
                 if is_writer:
                     assert rec is not None
-                    s_logits = out_logits.cpu()
                     t_logits = rec["logits"]
+                    kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
+                    kld_chunk = 512 if kld_dev is not None else 1024
                     if self_check and not self_checked:
-                        self_kld, _ = tokenwise_kld_fp64(t_logits, t_logits, vocab_limit=vocab_limit)
+                        self_kld, _ = tokenwise_kld_fp64(
+                            t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+                        )
                         if float(self_kld.max().item()) != 0.0:
                             raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
                         self_checked = True
                     kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
-                        t_logits, s_logits, token_ids[1:], vocab_limit=vocab_limit
+                        t_logits,
+                        out_logits,
+                        token_ids[1:],
+                        chunk=kld_chunk,
+                        vocab_limit=vocab_limit,
+                        compute_device=kld_dev,
                     )
                     klds.append(kld)
                     agrees.append(agree)
                     t_lps.append(t_lp)
                     s_lps.append(s_lp)
                     t_hits.append(hit)
-                    del s_logits, t_logits
+                    del t_logits
                 del ids, out_logits, rec
             if is_writer and klds:
                 summ = summarize_windows(

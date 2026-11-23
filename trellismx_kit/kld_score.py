@@ -93,8 +93,9 @@ def tokenwise_kld_fp64(
     *,
     chunk: int = 1024,
     vocab_limit: int | None = None,
+    compute_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return exact FP64 per-position KL(teacher || student) and uint8 top-1 match."""
+    """Return exact IEEE-754 FP64 per-position KL(teacher || student) and uint8 top-1 match."""
     if teacher_logits.ndim != 2 or student_logits.ndim != 2:
         raise ValueError("teacher_logits and student_logits must be 2D [N, V] tensors")
     if vocab_limit is not None:
@@ -108,8 +109,12 @@ def tokenwise_kld_fp64(
     klds, agree = [], []
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
-        t_raw = teacher_logits[start:stop].double()
-        s_raw = student_logits[start:stop].double()
+        if compute_device is not None:
+            t_raw = teacher_logits[start:stop].to(device=compute_device, dtype=torch.float64)
+            s_raw = student_logits[start:stop].to(device=compute_device, dtype=torch.float64)
+        else:
+            t_raw = teacher_logits[start:stop].double()
+            s_raw = student_logits[start:stop].double()
         if (
             bool(torch.isnan(t_raw).any())
             or bool(torch.isposinf(t_raw).any())
@@ -133,6 +138,7 @@ def tokenwise_kld_and_alignment_fp64(
     *,
     chunk: int = 1024,
     vocab_limit: int | None = None,
+    compute_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (kld, top1_agree, teacher_logp_realized, student_logp_realized, teacher_hits_realized)."""
     if vocab_limit is not None:
@@ -148,8 +154,12 @@ def tokenwise_kld_and_alignment_fp64(
     klds, agree, t_rlp, s_rlp, t_hit = [], [], [], [], []
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
-        t_raw = teacher_logits[start:stop].double()
-        s_raw = student_logits[start:stop].double()
+        if compute_device is not None:
+            t_raw = teacher_logits[start:stop].to(device=compute_device, dtype=torch.float64)
+            s_raw = student_logits[start:stop].to(device=compute_device, dtype=torch.float64)
+        else:
+            t_raw = teacher_logits[start:stop].double()
+            s_raw = student_logits[start:stop].double()
         if (
             bool(torch.isnan(t_raw).any())
             or bool(torch.isposinf(t_raw).any())
