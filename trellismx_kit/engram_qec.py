@@ -1379,6 +1379,21 @@ class FullStackQEC(nn.Module):
         self._route_cache.clear()
         return self.model(input_ids=input_ids, **kwargs)
 
+    def forward_hidden(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor | None:
+        """Run the transformer backbone without materializing full-sequence ``lm_head`` logits."""
+        backbone = getattr(self.model, "model", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        if backbone is None or lm_head is None or not callable(backbone):
+            return None
+        self.cur_tokens = input_ids
+        self._bank_cache.clear()
+        self._route_cache.clear()
+        outputs = backbone(input_ids=input_ids, **kwargs)
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None and isinstance(outputs, tuple) and outputs:
+            hidden = outputs[0]
+        return hidden
+
     def remove_hooks(self) -> None:
         for handle in reversed(self._lora_handles):
             handle.remove()
@@ -1649,6 +1664,72 @@ def topk_kl_loss(
             )
         else:
             chunk_loss = _topk_kl_chunk(s_chunk, idx_chunk, lp_chunk, lse_chunk, tlog_chunk, pt_chunk)
+        total_loss = total_loss + chunk_loss
+
+    return total_loss / float(max(1, bsz * seq_len))
+
+
+def topk_kl_loss_from_hidden(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    teacher_top_logp: torch.Tensor,
+    teacher_top_idx: torch.Tensor,
+    *,
+    teacher_logsumexp: torch.Tensor | None = None,
+    teacher_top_logits: torch.Tensor | None = None,
+    teacher_p_tail: torch.Tensor | None = None,
+    chunk_tokens: int = 512,
+) -> torch.Tensor:
+    """Chunked, checkpointed ``lm_head`` + log-space exact tail-calibrated KL over ``[B, T, H]``.
+
+    Projects only ``chunk_tokens`` at a time through ``lm_head`` (invoking any attached
+    ``lm_head`` LoRA hook), avoiding full-sequence ``[B, T, V]`` logit materialization on
+    long (16K-64K) training sequences while remaining mathematically identical to
+    ``topk_kl_loss(lm_head(hidden_states), ...)``.
+    """
+    bsz, seq_len, _hdim = hidden_states.shape
+    total_loss = hidden_states.new_zeros((), dtype=torch.float32)
+    use_ckpt = bool(hidden_states.requires_grad)
+
+    def _chunk_fn(
+        h_chunk: torch.Tensor,
+        idx_chunk: torch.Tensor,
+        t_logp_chunk: torch.Tensor,
+        t_lse_chunk: torch.Tensor | None,
+        t_logits_chunk: torch.Tensor | None,
+        t_ptail_chunk: torch.Tensor | None,
+    ) -> torch.Tensor:
+        s_chunk = lm_head(h_chunk)
+        return _topk_kl_chunk(
+            s_chunk,
+            idx_chunk,
+            t_logp_chunk,
+            t_lse_chunk,
+            t_logits_chunk,
+            t_ptail_chunk,
+        )
+
+    for t0 in range(0, seq_len, chunk_tokens):
+        t1 = min(seq_len, t0 + chunk_tokens)
+        h_chunk = hidden_states[:, t0:t1]
+        idx_chunk = teacher_top_idx[:, t0:t1]
+        lp_chunk = teacher_top_logp[:, t0:t1]
+        lse_chunk = teacher_logsumexp[:, t0:t1] if teacher_logsumexp is not None else None
+        tlog_chunk = teacher_top_logits[:, t0:t1] if teacher_top_logits is not None else None
+        pt_chunk = teacher_p_tail[:, t0:t1] if teacher_p_tail is not None else None
+        if use_ckpt:
+            chunk_loss = _grad_checkpoint(
+                _chunk_fn,
+                h_chunk,
+                idx_chunk,
+                lp_chunk,
+                lse_chunk,
+                tlog_chunk,
+                pt_chunk,
+                use_reentrant=False,
+            )
+        else:
+            chunk_loss = _chunk_fn(h_chunk, idx_chunk, lp_chunk, lse_chunk, tlog_chunk, pt_chunk)
         total_loss = total_loss + chunk_loss
 
     return total_loss / float(max(1, bsz * seq_len))

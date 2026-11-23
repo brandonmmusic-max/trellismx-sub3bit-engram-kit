@@ -18,6 +18,7 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from trellismx_kit.engram_qec import (
     build_context_curriculum,
     build_nfkc_canon_map,
     topk_kl_loss,
+    topk_kl_loss_from_hidden,
 )
 from trellismx_kit.glm5_patch import patch_ep_dp_all_to_all, patch_glm5_long_context
 from trellismx_kit.kld_score import (
@@ -456,7 +458,10 @@ def evaluate_dense_dir(
                     s_lps.append(s_lp)
                     t_hits.append(hit)
                     del t_logits
+                seq_len_win = int(token_ids.numel())
                 del ids, out_logits, rec
+                if seq_len_win >= 16384 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             if is_writer and klds:
                 summ = summarize_windows(
                     klds,
@@ -508,6 +513,9 @@ def evaluate_dense_dir(
     finally:
         if is_writer:
             torch.set_num_threads(orig_threads)
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
     if was_training:
         eval_model.train()
     return results
@@ -544,6 +552,7 @@ def parse_args() -> argparse.Namespace:
         help="One or more directories of pre-dumped long-context sparse top-K teacher shards (e.g. 16K, 32K, 64K)",
     )
     parser.add_argument("--eval-dense-dir", default="", help="Optional eval_dense/ directory for untouched FP64 KLD milestones")
+    parser.add_argument("--baseline-eval-json", default="", help="Optional pre-computed 0.0M baseline eval JSON to skip redundant baseline pass")
     parser.add_argument("--eval-milestones-m", default="10,35,50,75,100", help="Comma-separated token milestones (millions) for eval + checkpointing")
     parser.add_argument("--long-fraction", type=float, default=0.20)
     parser.add_argument("--curriculum-mode", choices=("interleaved", "tail"), default="interleaved")
@@ -669,11 +678,18 @@ def main() -> None:
             ep_rank=rank if args.distributed_ep else 0,
             ep_world_size=world_size if args.distributed_ep else 1,
         )
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
 
     out_dir = Path(args.output)
     eval_dir = Path(args.eval_dense_dir) if args.eval_dense_dir else None
     stock_baseline_eval = None
-    if eval_dir is not None and not args.resume:
+    if args.baseline_eval_json and not args.resume:
+        stock_baseline_eval = json.loads(Path(args.baseline_eval_json).read_text(encoding="utf-8"))
+        if is_writer:
+            print(f"[eval stock BF16 baseline @ 0.0M] loaded from {args.baseline_eval_json}", flush=True)
+    elif eval_dir is not None and not args.resume:
         stock_baseline_eval = evaluate_dense_dir(
             student, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
         )
@@ -935,6 +951,9 @@ def main() -> None:
             else:
                 short_cursor += chunks_this_step
 
+        if is_long and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         opt.zero_grad(set_to_none=True)
         acc_loss = 0.0
         for micro in range(grad_accum):
@@ -957,19 +976,40 @@ def main() -> None:
 
             ctx = model_run.no_sync() if (use_ddp and micro + 1 < grad_accum) else torch.enable_grad()
             with ctx:
-                s_logits = model_run(input_ids=ids, use_cache=False).logits[:, :-1]
-                loss = (
-                    topk_kl_loss(
-                        s_logits,
-                        top_logp,
-                        top_idx,
-                        teacher_p_tail=p_tail,
-                        chunk_tokens=args.loss_chunk_tokens,
-                    )
-                    / grad_accum
+                hidden = (
+                    qec.forward_hidden(input_ids=ids, use_cache=False)
+                    if not use_ddp
+                    else None
                 )
+                if hidden is not None:
+                    loss = (
+                        topk_kl_loss_from_hidden(
+                            hidden[:, :-1],
+                            qec.model.lm_head,
+                            top_logp,
+                            top_idx,
+                            teacher_p_tail=p_tail,
+                            chunk_tokens=args.loss_chunk_tokens,
+                        )
+                        / grad_accum
+                    )
+                    del hidden
+                else:
+                    s_logits = model_run(input_ids=ids, use_cache=False).logits[:, :-1]
+                    loss = (
+                        topk_kl_loss(
+                            s_logits,
+                            top_logp,
+                            top_idx,
+                            teacher_p_tail=p_tail,
+                            chunk_tokens=args.loss_chunk_tokens,
+                        )
+                        / grad_accum
+                    )
+                    del s_logits
                 loss.backward()
                 acc_loss += float(loss.item())
+                del loss
 
         if use_ep_sync:
             for p in trainable_params:
@@ -984,6 +1024,8 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         opt.step()
         sched.step()
+        if is_long and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if is_long:
             long_tokens_seen += int(step_ids.shape[0] * (step_ids.shape[1] - 1))
         else:
@@ -991,7 +1033,7 @@ def main() -> None:
 
         seen = short_tokens_seen + long_tokens_seen
         seen_m = seen / 1e6
-        if is_writer and ((step + 1) % 25 == 0 or step + 1 == total_steps):
+        if is_writer and (step == 0 or (step + 1) % 25 == 0 or step + 1 == total_steps):
             print(
                 f"step={step+1}/{total_steps} split={phase} positions={seen_m:.2f}M "
                 f"(short={short_tokens_seen/1e6:.2f}M long={long_tokens_seen/1e6:.2f}M) "
