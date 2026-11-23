@@ -213,6 +213,7 @@ def _load_model(
     trust_remote_code: bool,
     attn_implementation: str = "",
     experts_implementation: str = "",
+    ep_implementation: str = "all_to_all",
 ) -> torch.nn.Module:
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     archs = list(getattr(cfg, "architectures", None) or ())
@@ -237,15 +238,29 @@ def _load_model(
         cfg.base_model_tp_plan = None
         if hasattr(cfg, "text_config") and cfg.text_config is not None:
             cfg.text_config.base_model_tp_plan = None
+        if ep_implementation == "all_to_all":
+            cfg.base_model_fsdp_plan = None
+            if hasattr(cfg, "text_config") and cfg.text_config is not None:
+                cfg.text_config.base_model_fsdp_plan = None
         kwargs["config"] = cfg
         try:
-            kwargs["distributed_config"] = DistributedConfig(
-                ep_size=world_size,
-                tp_size=world_size,
-                fsdp_size=1,
-                pp_size=1,
-                ep_implementation="all_reduce",
-            )
+            if ep_implementation == "all_to_all":
+                kwargs["distributed_config"] = DistributedConfig(
+                    ep_size=world_size,
+                    tp_size=1,
+                    fsdp_size=world_size,
+                    fsdp_plan={},
+                    pp_size=1,
+                    ep_implementation="all_to_all",
+                )
+            else:
+                kwargs["distributed_config"] = DistributedConfig(
+                    ep_size=world_size,
+                    tp_size=world_size,
+                    fsdp_size=1,
+                    pp_size=1,
+                    ep_implementation="all_reduce",
+                )
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
@@ -539,7 +554,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-grad-accum", type=int, default=4)
     parser.add_argument("--grad-checkpointing", action="store_true")
     parser.add_argument("--device-map-auto", action="store_true", help="Shard frozen student across GPUs with device_map='auto'")
-    parser.add_argument("--distributed-ep", action="store_true", help="Run torchrun Expert/Tensor Parallel student")
+    parser.add_argument("--distributed-ep", action="store_true", help="Run torchrun Expert Parallel student")
+    parser.add_argument(
+        "--ep-implementation",
+        choices=("all_to_all", "all_reduce"),
+        default="all_to_all",
+        help="EP token dispatch mode under --distributed-ep ('all_to_all' runs 8x DP on non-expert layers)",
+    )
     parser.add_argument("--attn-implementation", default="")
     parser.add_argument("--experts-implementation", default="", help="Optional HF experts_implementation (e.g. grouped_mm)")
     parser.add_argument("--topk", type=int, default=128)
@@ -574,7 +595,10 @@ def main() -> None:
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     is_writer = rank == 0
-    dp_world = 1 if (args.distributed_ep or args.device_map_auto) else world_size
+    if args.device_map_auto or (args.distributed_ep and args.ep_implementation != "all_to_all"):
+        dp_world = 1
+    else:
+        dp_world = world_size
     dp_rank = 0 if dp_world == 1 else rank
 
     short_shards = _ShardStream(args.teacher_shards) if use_shards else None
@@ -619,6 +643,7 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
         experts_implementation=args.experts_implementation,
+        ep_implementation=args.ep_implementation,
     )
     if args.per_expert_release:
         _install_per_expert_release(

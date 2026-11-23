@@ -52,7 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logit-chunk-tokens", type=int, default=2048, help="Sequence chunk size for FP32 logsumexp/topk")
     parser.add_argument("--rows-per-shard", type=int, default=512)
     parser.add_argument("--long-rows-per-shard", type=int, default=64)
-    parser.add_argument("--distributed-ep", action="store_true", help="Load with Transformers DistributedConfig(tp_size=WORLD_SIZE, enable_expert_parallel=True)")
+    parser.add_argument("--distributed-ep", action="store_true", help="Load with Transformers DistributedConfig Expert Parallel")
+    parser.add_argument(
+        "--ep-implementation",
+        choices=("all_to_all", "all_reduce"),
+        default="all_to_all",
+        help="EP token dispatch mode under --distributed-ep ('all_to_all' runs 8x DP on non-expert layers)",
+    )
     parser.add_argument("--shard-rank", type=int, default=0, help="Independent worker shard index for partitioning shards across jobs")
     parser.add_argument("--shard-world", type=int, default=1, help="Total independent worker count for shard partitioning")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -71,6 +77,7 @@ def load_hf_model(
     trust_remote_code: bool,
     attn_implementation: str = "",
     experts_implementation: str = "",
+    ep_implementation: str = "all_to_all",
 ) -> torch.nn.Module:
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     archs = list(getattr(cfg, "architectures", None) or ())
@@ -92,19 +99,34 @@ def load_hf_model(
     if distributed_ep and world_size > 1:
         from transformers.distributed.configuration_utils import DistributedConfig
 
-        # Keep pure EP on experts + lm_head TP only; avoids upstream hybrid linear_attention o_proj TP mismatch
+        # Keep pure EP on experts only; avoids upstream hybrid linear_attention o_proj TP mismatch
+        # and avoids FSDP sharding overhead on replicated non-expert layers under all_to_all DP+EP.
         cfg.base_model_tp_plan = None
         if hasattr(cfg, "text_config") and cfg.text_config is not None:
             cfg.text_config.base_model_tp_plan = None
+        if ep_implementation == "all_to_all":
+            cfg.base_model_fsdp_plan = None
+            if hasattr(cfg, "text_config") and cfg.text_config is not None:
+                cfg.text_config.base_model_fsdp_plan = None
         kwargs["config"] = cfg
         try:
-            kwargs["distributed_config"] = DistributedConfig(
-                ep_size=world_size,
-                tp_size=world_size,
-                fsdp_size=1,
-                pp_size=1,
-                ep_implementation="all_reduce",
-            )
+            if ep_implementation == "all_to_all":
+                kwargs["distributed_config"] = DistributedConfig(
+                    ep_size=world_size,
+                    tp_size=1,
+                    fsdp_size=world_size,
+                    fsdp_plan={},
+                    pp_size=1,
+                    ep_implementation="all_to_all",
+                )
+            else:
+                kwargs["distributed_config"] = DistributedConfig(
+                    ep_size=world_size,
+                    tp_size=world_size,
+                    fsdp_size=1,
+                    pp_size=1,
+                    ep_implementation="all_reduce",
+                )
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
@@ -180,6 +202,41 @@ def dump_dense_eval(
 
 
 @torch.no_grad()
+def _extract_sparse_topk(
+    raw_logits: torch.Tensor,
+    *,
+    topk: int,
+    logit_chunk_tokens: int,
+    to_cpu: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    pos_per_row = int(raw_logits.shape[1])
+    c_idx, c_logp, c_ptail, c_lse = [], [], [], []
+    for s0 in range(0, pos_per_row, logit_chunk_tokens):
+        s1 = min(pos_per_row, s0 + logit_chunk_tokens)
+        chunk_f = raw_logits[:, s0:s1].float()
+        lse = torch.logsumexp(chunk_f, dim=-1)
+        top_vals, top_idx = torch.topk(chunk_f, k=topk, dim=-1)
+        top_logp = (top_vals - lse.unsqueeze(-1)).clamp_max(0.0)
+        p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
+        if to_cpu:
+            c_idx.append(top_idx.to(torch.int32).cpu())
+            c_logp.append(top_logp.to(torch.float16).cpu())
+            c_ptail.append(p_tail.to(torch.float32).cpu())
+            c_lse.append(lse.to(torch.float32).cpu())
+        else:
+            c_idx.append(top_idx.to(torch.int32))
+            c_logp.append(top_logp.to(torch.float16))
+            c_ptail.append(p_tail.to(torch.float32))
+            c_lse.append(lse.to(torch.float32))
+    return (
+        torch.cat(c_idx, dim=1).contiguous(),
+        torch.cat(c_logp, dim=1).contiguous(),
+        torch.cat(c_ptail, dim=1).contiguous(),
+        torch.cat(c_lse, dim=1).contiguous(),
+    )
+
+
+@torch.no_grad()
 def dump_sparse_split(
     model: torch.nn.Module,
     tokens: torch.Tensor,
@@ -193,6 +250,8 @@ def dump_sparse_split(
     is_writer: bool = True,
     shard_rank: int = 0,
     shard_world: int = 1,
+    dp_rank: int = 0,
+    dp_world: int = 1,
     resume: bool = False,
 ) -> dict[str, object]:
     if is_writer:
@@ -202,8 +261,9 @@ def dump_sparse_split(
     seq_len = int(tokens.shape[1])
     pos_per_row = seq_len - 1
     shard_id = 0
-    written_shards = 0
+    new_positions = 0
     t0 = time.time()
+    use_dp_gather = dp_world > 1 and dist.is_initialized()
 
     for shard_start in range(0, n_rows, rows_per_shard):
         shard_end = min(n_rows, shard_start + rows_per_shard)
@@ -213,36 +273,59 @@ def dump_sparse_split(
             continue
         out_path = out_dir / f"shard-{cur_shard:04d}.pt"
         if resume and out_path.exists():
-            written_shards += 1
             continue
 
         ids_buf, idx_buf, logp_buf, ptail_buf, lse_buf = [], [], [], [], []
-        for b0 in range(shard_start, shard_end, batch_size):
-            b1 = min(shard_end, b0 + batch_size)
-            ids = tokens[b0:b1].to(device=dev, dtype=torch.long)
+        global_bs = batch_size * dp_world if use_dp_gather else batch_size
+        for b0 in range(shard_start, shard_end, global_bs):
+            b1 = min(shard_end, b0 + global_bs)
+            n_real = b1 - b0
+            if use_dp_gather:
+                per_rank_bs = (n_real + dp_world - 1) // dp_world
+                row_indices = [
+                    min(b1 - 1, b0 + dp_rank * per_rank_bs + i)
+                    for i in range(per_rank_bs)
+                ]
+                ids = tokens[row_indices].to(device=dev, dtype=torch.long)
+            else:
+                ids = tokens[b0:b1].to(device=dev, dtype=torch.long)
+
             raw_logits = model(input_ids=ids, use_cache=False).logits[:, :-1]
             if vocab_limit > 0:
                 raw_logits = raw_logits[:, :, :vocab_limit]
 
-            if is_writer:
-                c_idx, c_logp, c_ptail, c_lse = [], [], [], []
-                for s0 in range(0, pos_per_row, logit_chunk_tokens):
-                    s1 = min(pos_per_row, s0 + logit_chunk_tokens)
-                    chunk_f = raw_logits[:, s0:s1].float()
-                    lse = torch.logsumexp(chunk_f, dim=-1)
-                    top_vals, top_idx = torch.topk(chunk_f, k=topk, dim=-1)
-                    top_logp = (top_vals - lse.unsqueeze(-1)).clamp_max(0.0)
-                    p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
-                    c_idx.append(top_idx.to(torch.int32).cpu())
-                    c_logp.append(top_logp.to(torch.float16).cpu())
-                    c_ptail.append(p_tail.to(torch.float32).cpu())
-                    c_lse.append(lse.to(torch.float32).cpu())
-
+            if use_dp_gather:
+                loc_idx, loc_logp, loc_ptail, loc_lse = _extract_sparse_topk(
+                    raw_logits, topk=topk, logit_chunk_tokens=logit_chunk_tokens, to_cpu=False
+                )
+                del raw_logits
+                g_idx = [torch.empty_like(loc_idx) for _ in range(dp_world)] if is_writer else None
+                g_logp = [torch.empty_like(loc_logp) for _ in range(dp_world)] if is_writer else None
+                g_ptail = [torch.empty_like(loc_ptail) for _ in range(dp_world)] if is_writer else None
+                g_lse = [torch.empty_like(loc_lse) for _ in range(dp_world)] if is_writer else None
+                dist.gather(loc_idx, g_idx, dst=0)
+                dist.gather(loc_logp, g_logp, dst=0)
+                dist.gather(loc_ptail, g_ptail, dst=0)
+                dist.gather(loc_lse, g_lse, dst=0)
+                del loc_idx, loc_logp, loc_ptail, loc_lse
+                if is_writer:
+                    assert g_idx is not None and g_logp is not None and g_ptail is not None and g_lse is not None
+                    ids_buf.append(tokens[b0:b1].to(torch.int32).cpu())
+                    idx_buf.append(torch.cat(g_idx, dim=0)[:n_real].cpu())
+                    logp_buf.append(torch.cat(g_logp, dim=0)[:n_real].cpu())
+                    ptail_buf.append(torch.cat(g_ptail, dim=0)[:n_real].cpu())
+                    lse_buf.append(torch.cat(g_lse, dim=0)[:n_real].cpu())
+                    del g_idx, g_logp, g_ptail, g_lse
+            elif is_writer:
+                loc_idx, loc_logp, loc_ptail, loc_lse = _extract_sparse_topk(
+                    raw_logits, topk=topk, logit_chunk_tokens=logit_chunk_tokens, to_cpu=True
+                )
+                del raw_logits
                 ids_buf.append(tokens[b0:b1].to(torch.int32).cpu())
-                idx_buf.append(torch.cat(c_idx, dim=1))
-                logp_buf.append(torch.cat(c_logp, dim=1))
-                ptail_buf.append(torch.cat(c_ptail, dim=1))
-                lse_buf.append(torch.cat(c_lse, dim=1))
+                idx_buf.append(loc_idx)
+                logp_buf.append(loc_logp)
+                ptail_buf.append(loc_ptail)
+                lse_buf.append(loc_lse)
 
         if is_writer:
             tmp_path = out_path.with_suffix(".pt.tmp")
@@ -257,9 +340,8 @@ def dump_sparse_split(
                 tmp_path,
             )
             os.replace(tmp_path, out_path)
-            written_shards += 1
-            done_positions = written_shards * rows_per_shard * pos_per_row
-            rate = done_positions / max(1e-6, time.time() - t0)
+            new_positions += (shard_end - shard_start) * pos_per_row
+            rate = new_positions / max(1e-6, time.time() - t0)
             print(
                 f"[{out_dir.name}] shard={cur_shard}/{shard_id} worker={shard_rank}/{shard_world} "
                 f"rows={shard_end}/{n_rows} rate={rate:.0f} pos/s",
@@ -303,12 +385,16 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
         experts_implementation=args.experts_implementation,
+        ep_implementation=args.ep_implementation,
     )
+    dp_world = world_size if (distributed and args.ep_implementation == "all_to_all") else 1
+    dp_rank = rank if dp_world > 1 else 0
 
     manifest: dict[str, object] = {
         "teacher_model": args.teacher_model,
         "topk": args.topk,
         "distributed_ep": bool(distributed),
+        "ep_implementation": args.ep_implementation if distributed else "none",
         "world_size": world_size,
     }
     if args.eval_tokens and args.shard_rank == 0:
@@ -344,6 +430,8 @@ def main() -> None:
             is_writer=is_writer,
             shard_rank=args.shard_rank,
             shard_world=args.shard_world,
+            dp_rank=dp_rank,
+            dp_world=dp_world,
             resume=args.resume,
         )
     if args.long_tokens:
@@ -364,6 +452,8 @@ def main() -> None:
                 is_writer=is_writer,
                 shard_rank=args.shard_rank,
                 shard_world=args.shard_world,
+                dp_rank=dp_rank,
+                dp_world=dp_world,
                 resume=args.resume,
             )
         manifest["train_long"] = long_summaries

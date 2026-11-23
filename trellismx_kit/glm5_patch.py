@@ -197,13 +197,61 @@ def _make_chunked_attention_forward(attn: nn.Module, q_chunk: int = 4096):
     return chunked_forward
 
 
+def patch_glm5_fla_causal_conv1d() -> bool:
+    """Replace pure-PyTorch Glm5Next causal_conv1d_fn fallback with fla Triton kernel when available."""
+    try:
+        from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+        import transformers.models.glm5_next.modeling_glm5_next as glm5_mod
+    except Exception:
+        return False
+
+    if getattr(glm5_mod, "_trellismx_fla_conv1d_patched", False):
+        return True
+
+    def _fla_causal_conv1d_fn(
+        hidden_states: torch.Tensor,
+        weight: nn.Parameter,
+        bias: nn.Parameter | None = None,
+        activation: str | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if hidden_states.device.type != "cuda":
+            _, hidden_size, seq_len = hidden_states.shape
+            padding = weight.shape[-1] - 1
+            out = F.conv1d(
+                hidden_states.to(weight.dtype),
+                weight=weight.unsqueeze(1),
+                bias=bias,
+                padding=padding,
+                groups=hidden_size,
+            )[:, :, :seq_len]
+            if activation == "silu":
+                out = F.silu(out)
+            return out.to(hidden_states.dtype)
+        # fla causal_conv1d expects [B, T, D]; Glm5Next passes [B, D, T].
+        x_btd = hidden_states.transpose(1, 2).contiguous()
+        out_btd, _ = fla_causal_conv1d(
+            x_btd,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            backend="triton",
+        )
+        return out_btd.transpose(1, 2).to(hidden_states.dtype)
+
+    glm5_mod.causal_conv1d_fn = _fla_causal_conv1d_fn  # type: ignore[attr-defined]
+    glm5_mod._trellismx_fla_conv1d_patched = True  # type: ignore[attr-defined]
+    return True
+
+
 def patch_glm5_long_context(
     model: nn.Module,
     *,
     indexer_q_chunk: int = 2048,
     attn_q_chunk: int = 4096,
 ) -> tuple[int, int]:
-    """Install query-chunked forwards on Glm5Next DSA indexer and full-attention modules."""
+    """Install query-chunked forwards on Glm5Next DSA indexer and full-attention modules, plus fla conv1d."""
+    patch_glm5_fla_causal_conv1d()
     n_idx = 0
     n_attn = 0
     for mod in model.modules():
