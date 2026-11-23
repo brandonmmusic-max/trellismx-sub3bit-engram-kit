@@ -18,6 +18,7 @@ Supports:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import gc
 import json
 import math
@@ -190,6 +191,29 @@ class _MultiLengthShardStream:
         idx = self.schedule[self._pos % len(self.schedule)]
         self._pos += 1
         return self.streams[idx].take(count)
+
+
+def _offload_large_saved_tensors(min_bytes: int = 32 * 1024 * 1024):
+    """Offload large non-leaf saved forward activations to host RAM during long-context passes.
+
+    Under gradient checkpointing on 4-stream mHC architectures (e.g. GLM-5.3-Flash), saving
+    each layer's boundary hidden state at 32K/64K consumes 45-90 GiB of VRAM across 45 layers.
+    Moving only large (>=32 MiB) non-leaf CUDA activations to host RAM leaves parameters and
+    small buffers on GPU while keeping 32K/64K peak VRAM well under 140 GiB.
+    """
+
+    def _pack(t: torch.Tensor):
+        if t.is_cuda and (not t.is_leaf) and (t.numel() * t.element_size() >= min_bytes):
+            return (t.device, t.detach().cpu())
+        return (None, t)
+
+    def _unpack(packed):
+        dev, t = packed
+        if dev is not None:
+            return t.to(device=dev, non_blocking=True)
+        return t
+
+    return torch.autograd.graph.saved_tensors_hooks(_pack, _unpack)
 
 
 def _input_device(model: torch.nn.Module) -> torch.device:
@@ -979,12 +1003,17 @@ def main() -> None:
                     p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
 
             ctx = model_run.no_sync() if (use_ddp and micro + 1 < grad_accum) else torch.enable_grad()
+            offload_ctx = (
+                _offload_large_saved_tensors()
+                if (int(ids.shape[1]) >= 16384 and in_dev.type == "cuda")
+                else nullcontext()
+            )
             with ctx:
-                hidden = (
-                    qec.forward_hidden(input_ids=ids, use_cache=False)
-                    if not use_ddp
-                    else None
-                )
+                if not use_ddp:
+                    with offload_ctx:
+                        hidden = qec.forward_hidden(input_ids=ids, use_cache=False)
+                else:
+                    hidden = None
                 if hidden is not None:
                     loss = (
                         topk_kl_loss_from_hidden(
@@ -999,7 +1028,8 @@ def main() -> None:
                     )
                     del hidden
                 else:
-                    s_logits = model_run(input_ids=ids, use_cache=False).logits[:, :-1]
+                    with offload_ctx:
+                        s_logits = model_run(input_ids=ids, use_cache=False).logits[:, :-1]
                     loss = (
                         topk_kl_loss(
                             s_logits,
@@ -1039,7 +1069,7 @@ def main() -> None:
         seen_m = seen / 1e6
         if is_writer and (step == 0 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
             print(
-                f"step={step+1}/{total_steps} split={phase} positions={seen_m:.2f}M "
+                f"step={step+1}/{total_steps} split={phase} seq={int(step_ids.shape[1])} positions={seen_m:.2f}M "
                 f"(short={short_tokens_seen/1e6:.2f}M long={long_tokens_seen/1e6:.2f}M) "
                 f"loss={acc_loss:.4f} t={time.time()-t0:.1f}s",
                 flush=True,
