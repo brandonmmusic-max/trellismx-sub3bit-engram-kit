@@ -347,11 +347,12 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
                 if n_tok <= passthrough_tokens:
                     return fn(hidden_states, top_k_index, top_k_weights)
                 use_ckpt = bool(n_tok >= 32768 and torch.is_grad_enabled() and hidden_states.requires_grad)
+                eff_chunk = min(chunk_tokens, 4096) if n_tok >= 65536 else chunk_tokens
                 parts = []
-                for i in range(0, n_tok, chunk_tokens):
-                    h_c = hidden_states[i : i + chunk_tokens]
-                    idx_c = top_k_index[i : i + chunk_tokens]
-                    w_c = top_k_weights[i : i + chunk_tokens]
+                for i in range(0, n_tok, eff_chunk):
+                    h_c = hidden_states[i : i + eff_chunk]
+                    idx_c = top_k_index[i : i + eff_chunk]
+                    w_c = top_k_weights[i : i + eff_chunk]
                     if use_ckpt:
                         parts.append(
                             torch.utils.checkpoint.checkpoint(

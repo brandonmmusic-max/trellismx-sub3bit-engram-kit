@@ -514,7 +514,7 @@ class DualTrellisEngramLayer(nn.Module):
     ) -> torch.Tensor:
         e_uni, e_bi, e_tri, e_skip = bank_out
         seq_len = int(hidden.shape[1])
-        seq_chunk = 8192
+        seq_chunk = 4096 if seq_len >= 65536 else 8192
 
         if seq_len <= 16384:
             y = self._pointwise_orders(hidden, e_uni, e_bi, e_tri, e_skip, route_weights_dense)
