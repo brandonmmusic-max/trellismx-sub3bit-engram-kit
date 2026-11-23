@@ -766,7 +766,7 @@ def main() -> None:
     out_dir = Path(args.output)
     eval_dir = Path(args.eval_dense_dir) if args.eval_dense_dir else None
     stock_baseline_eval = None
-    if args.baseline_eval_json and not args.resume:
+    if args.baseline_eval_json:
         stock_baseline_eval = json.loads(Path(args.baseline_eval_json).read_text(encoding="utf-8"))
         if is_writer:
             print(f"[eval stock BF16 baseline @ 0.0M] loaded from {args.baseline_eval_json}", flush=True)
@@ -1044,7 +1044,20 @@ def main() -> None:
             else:
                 short_cursor += chunks_this_step
 
-        if is_long and torch.cuda.is_available():
+        offloaded_opt_states: list[tuple[dict[str, Any], str, torch.device]] = []
+        if is_long and int(step_ids.shape[1]) >= 65536 and torch.cuda.is_available():
+            # Temporarily park large (>=8M) AdamW moment buffers in host RAM during 64K forward+backward
+            # (~12.4 GiB freed on GPU) and move them back before opt.step(); bit-exact, ~0.6s overhead.
+            for st in opt.state.values():
+                if not isinstance(st, dict):
+                    continue
+                for sk, sv in list(st.items()):
+                    if isinstance(sv, torch.Tensor) and sv.is_cuda and sv.numel() >= 8_000_000:
+                        orig_dev = sv.device
+                        st[sk] = sv.detach().cpu()
+                        offloaded_opt_states.append((st, sk, orig_dev))
+            torch.cuda.empty_cache()
+        elif is_long and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         opt.zero_grad(set_to_none=True)
@@ -1150,6 +1163,11 @@ def main() -> None:
             for h in handles:
                 h.wait()
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        if offloaded_opt_states:
+            torch.cuda.empty_cache()
+            for st, sk, orig_dev in offloaded_opt_states:
+                st[sk] = st[sk].to(device=orig_dev, non_blocking=True)
+            offloaded_opt_states.clear()
         opt.step()
         sched.step()
         if is_long and torch.cuda.is_available():
@@ -1161,7 +1179,7 @@ def main() -> None:
 
         seen = short_tokens_seen + long_tokens_seen
         seen_m = seen / 1e6
-        if is_writer and (step <= 2 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
+        if is_writer and (step <= start_step + 2 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
             vram_str = (
                 f" vram={torch.cuda.max_memory_allocated(device)/(1024**3):.1f}GiB"
                 if torch.cuda.is_available()

@@ -836,11 +836,11 @@ class AttentionLoRA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dev = self.a.weight.device
-        # Keep only the rank-r bottleneck in FP32 so large out_features (e.g. lm_head at 64K)
-        # never materialize a 40+ GiB FP32 output tensor.
-        x_f = x.to(device=dev, dtype=torch.float32)
-        mid = F.linear(x_f, self.a.weight.float()) * self.scale
-        out = F.linear(mid.to(dtype=x.dtype), self.b.weight.to(dtype=x.dtype))
+        # Run both low-rank projections in x.dtype (BF16 on B200) while keeping FP32 master weights
+        # for AdamW, avoiding multi-GiB FP32 input/output casts at 64K sequence lengths.
+        x_d = x.to(device=dev)
+        mid = F.linear(x_d, self.a.weight.to(dtype=x_d.dtype)) * self.scale
+        out = F.linear(mid, self.b.weight.to(dtype=x_d.dtype))
         return out.to(device=x.device, dtype=x.dtype)
 
     @torch.no_grad()
