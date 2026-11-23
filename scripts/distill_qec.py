@@ -1071,6 +1071,10 @@ def main() -> None:
         seen_m = (short_tokens_seen + long_tokens_seen) / 1e6
         while next_milestone_idx < len(milestones_m) and milestones_m[next_milestone_idx] <= seen_m + 1e-6:
             next_milestone_idx += 1
+        del ckpt
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         _sync_ep_qec_params()
 
     if eval_dir is not None and start_step == 0 and stock_baseline_eval is not None:
@@ -1140,8 +1144,8 @@ def main() -> None:
                 short_cursor += chunks_this_step
 
         offloaded_opt_states: list[tuple[dict[str, Any], str, torch.device]] = []
-        if is_long and int(step_ids.shape[1]) >= 65536 and torch.cuda.is_available():
-            # Temporarily park ALL CUDA AdamW state tensors in host RAM during 64K forward+backward
+        if is_long and int(step_ids.shape[1]) >= 32768 and torch.cuda.is_available():
+            # Temporarily park ALL CUDA AdamW state tensors in host RAM during 32K/64K forward+backward
             # (~14 GiB freed on GPU) and move them back right before opt.step(); bit-exact, ~0.7s overhead.
             for st in opt.state.values():
                 if not isinstance(st, dict):
@@ -1221,7 +1225,7 @@ def main() -> None:
                         / grad_accum
                     )
                     del s_logits
-                if seq_len_cur >= 32768 and torch.cuda.is_available():
+                if seq_len_cur >= 16384 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 with offload_bwd_ctx:
                     loss.backward()
@@ -1266,7 +1270,9 @@ def main() -> None:
             offloaded_opt_states.clear()
         opt.step()
         sched.step()
-        if is_long and torch.cuda.is_available():
+        if torch.cuda.is_available() and (
+            is_long or (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device) > 4 * 1024**3)
+        ):
             torch.cuda.empty_cache()
         if is_long:
             long_tokens_seen += int(step_ids.shape[0] * (step_ids.shape[1] - 1))
