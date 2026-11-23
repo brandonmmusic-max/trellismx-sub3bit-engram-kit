@@ -580,6 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-milestones-m", default="10,35,50,75,100", help="Comma-separated token milestones (millions) for eval + checkpointing")
     parser.add_argument("--long-fraction", type=float, default=0.20)
     parser.add_argument("--curriculum-mode", choices=("interleaved", "tail"), default="interleaved")
+    parser.add_argument("--warmup-longest-first", action="store_true", help="Swap the first longest-context step to step 0 to validate peak VRAM immediately")
     parser.add_argument("--engram-mode", choices=("v2_shared_banks", "v1_per_layer"), default="v2_shared_banks")
     parser.add_argument("--engram-layers", default="", help="Comma-separated layer indices for Engram QEC")
     parser.add_argument("--engram-banks", default="", help="Explicit depth banks, e.g. 'early:3,5,7,9;mid:12,16,20,24,28,32;late:36,39,42,44'")
@@ -860,6 +861,14 @@ def main() -> None:
         long_fraction=effective_long_fraction,
         mode=args.curriculum_mode,
     )
+    if args.warmup_longest_first and long_shards is not None and "long" in schedule:
+        first_long_idx = schedule.index("long")
+        if first_long_idx != 0:
+            schedule[0], schedule[first_long_idx] = schedule[first_long_idx], schedule[0]
+        longest_stream = max(range(len(long_shards.streams)), key=lambda i: long_shards.streams[i].seq_len)
+        if longest_stream in long_shards.schedule:
+            rot = long_shards.schedule.index(longest_stream)
+            long_shards.schedule = long_shards.schedule[rot:] + long_shards.schedule[:rot]
     total_steps = len(schedule)
     warmup = max(20, total_steps // 20)
 

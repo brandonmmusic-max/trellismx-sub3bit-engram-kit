@@ -168,11 +168,17 @@ def _make_chunked_attention_forward(attn: nn.Module, q_chunk: int = 4096):
         kv_len = key_states.shape[2]
         drop_p = 0.0 if not attn.training else attn.attention_dropout
 
-        out_chunks: list[torch.Tensor] = []
-        for q0 in range(0, seq_length, q_chunk):
-            q1 = min(seq_length, q0 + q_chunk)
-            q_c = query_states[:, :, q0:q1, :]
-            topk_c = topk_indices[:, q0:q1, :]
+        use_ckpt = bool(
+            torch.is_grad_enabled()
+            and (query_states.requires_grad or key_states.requires_grad or value_states.requires_grad)
+        )
+
+        def _attn_chunk(
+            q_c: torch.Tensor,
+            k_s: torch.Tensor,
+            v_s: torch.Tensor,
+            topk_c: torch.Tensor,
+        ) -> torch.Tensor:
             mask_c = attn.build_attention_mask_from_topk(
                 topk_indices=topk_c,
                 query_states=q_c,
@@ -181,13 +187,31 @@ def _make_chunked_attention_forward(attn: nn.Module, q_chunk: int = 4096):
             out_c, _ = attention_interface(
                 attn,
                 q_c,
-                key_states,
-                value_states,
+                k_s,
+                v_s,
                 mask_c,
                 dropout=drop_p,
                 scaling=attn.scaling,
                 **kwargs,
             )
+            return out_c
+
+        out_chunks: list[torch.Tensor] = []
+        for q0 in range(0, seq_length, q_chunk):
+            q1 = min(seq_length, q0 + q_chunk)
+            q_c = query_states[:, :, q0:q1, :]
+            topk_c = topk_indices[:, q0:q1, :]
+            if use_ckpt:
+                out_c = torch.utils.checkpoint.checkpoint(
+                    _attn_chunk,
+                    q_c,
+                    key_states,
+                    value_states,
+                    topk_c,
+                    use_reentrant=False,
+                )
+            else:
+                out_c = _attn_chunk(q_c, key_states, value_states, topk_c)
             out_chunks.append(out_c)
 
         attn_output = torch.cat(out_chunks, dim=1).reshape(batch_size, seq_length, -1).contiguous()
