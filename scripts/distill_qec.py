@@ -759,6 +759,13 @@ def main() -> None:
             ep_rank=rank if args.distributed_ep else 0,
             ep_world_size=world_size if args.distributed_ep else 1,
         )
+        # Move unused frozen vision tower to CPU during text-only distillation to reclaim ~1.8 GiB VRAM/GPU.
+        inner_model = getattr(student, "model", None)
+        visual_mod = getattr(inner_model, "visual", None) if inner_model is not None else getattr(student, "visual", None)
+        if isinstance(visual_mod, torch.nn.Module):
+            visual_mod.to("cpu")
+            if is_writer:
+                print("[mem] moved unused frozen vision tower to CPU for text-only distillation", flush=True)
         if torch.cuda.is_available():
             gc.collect()
             torch.cuda.empty_cache()
@@ -1046,13 +1053,13 @@ def main() -> None:
 
         offloaded_opt_states: list[tuple[dict[str, Any], str, torch.device]] = []
         if is_long and int(step_ids.shape[1]) >= 65536 and torch.cuda.is_available():
-            # Temporarily park large (>=8M) AdamW moment buffers in host RAM during 64K forward+backward
-            # (~12.4 GiB freed on GPU) and move them back before opt.step(); bit-exact, ~0.6s overhead.
+            # Temporarily park ALL CUDA AdamW state tensors in host RAM during 64K forward+backward
+            # (~14 GiB freed on GPU) and move them back right before opt.step(); bit-exact, ~0.7s overhead.
             for st in opt.state.values():
                 if not isinstance(st, dict):
                     continue
                 for sk, sv in list(st.items()):
-                    if isinstance(sv, torch.Tensor) and sv.is_cuda and sv.numel() >= 8_000_000:
+                    if isinstance(sv, torch.Tensor) and sv.is_cuda:
                         orig_dev = sv.device
                         st[sk] = sv.detach().cpu()
                         offloaded_opt_states.append((st, sk, orig_dev))
@@ -1082,13 +1089,14 @@ def main() -> None:
 
             ctx = model_run.no_sync() if (use_ddp and micro + 1 < grad_accum) else torch.enable_grad()
             seq_len_cur = int(ids.shape[1])
+            min_offload = 4 * 1024 * 1024 if seq_len_cur >= 65536 else 16 * 1024 * 1024
             offload_ctx = (
-                _offload_large_saved_tensors(min_bytes=16 * 1024 * 1024)
+                _offload_large_saved_tensors(min_bytes=min_offload)
                 if (seq_len_cur >= 32768 and in_dev.type == "cuda")
                 else nullcontext()
             )
             offload_bwd_ctx = (
-                _offload_large_saved_tensors(min_bytes=16 * 1024 * 1024)
+                _offload_large_saved_tensors(min_bytes=min_offload)
                 if (seq_len_cur >= 65536 and in_dev.type == "cuda")
                 else nullcontext()
             )
