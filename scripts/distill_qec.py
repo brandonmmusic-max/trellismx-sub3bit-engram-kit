@@ -416,8 +416,16 @@ def evaluate_dense_dir(
     self_check: bool = True,
     strict_alignment: bool = False,
     is_writer: bool = True,
+    dp_world: int = 1,
+    dp_rank: int = 0,
 ) -> dict[str, dict[str, object]]:
-    """Evaluate untouched exact FP64 KLD grouped by split prefix in ``eval_dir``."""
+    """Evaluate untouched exact FP64 KLD grouped by split prefix in ``eval_dir``.
+
+    When ``dp_world > 1`` (DP+EP ``all_to_all``), each rank scores a distinct
+    ``batch_size = 1`` window in parallel and gathers the 1D per-position FP64
+    vectors to rank 0 in exact original window order, preserving single-window
+    determinism while scaling evaluation throughput linearly with DP ranks.
+    """
     was_training = eval_model.training
     eval_model.eval()
     base_mod = eval_model.model if isinstance(eval_model, FullStackQEC) else eval_model
@@ -428,6 +436,7 @@ def evaluate_dense_dir(
         split = p.stem.split("-window-")[0]
         grouped.setdefault(split, []).append(p)
 
+    use_dp_eval = bool(dp_world > 1 and dist.is_initialized())
     results: dict[str, dict[str, object]] = {}
     orig_threads = torch.get_num_threads()
     if is_writer:
@@ -442,50 +451,97 @@ def evaluate_dense_dir(
             s_lps: list[torch.Tensor] = []
             t_hits: list[torch.Tensor] = []
             self_checked = False
-            for p in split_paths:
-                rec = None
-                if is_writer or not dist.is_initialized():
+            if use_dp_eval:
+                n_win = len(split_paths)
+                for w0 in range(0, n_win, dp_world):
+                    my_idx = w0 + dp_rank
+                    is_real = my_idx < n_win
+                    p = split_paths[my_idx] if is_real else split_paths[0]
                     rec = torch.load(p, map_location="cpu", weights_only=True)
                     token_ids = rec["token_ids"]
-                else:
-                    token_ids = None
-                if dist.is_initialized():
-                    obj = [token_ids]
-                    dist.broadcast_object_list(obj, src=0)
-                    token_ids = obj[0]
-                assert token_ids is not None
-                ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-                out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
-                if is_writer:
-                    assert rec is not None
-                    t_logits = rec["logits"]
-                    kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
-                    kld_chunk = 512 if kld_dev is not None else 1024
-                    if self_check and not self_checked:
-                        self_kld, _ = tokenwise_kld_fp64(
-                            t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+                    ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
+                    out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
+                    local_payload = None
+                    if is_real:
+                        t_logits = rec["logits"]
+                        kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
+                        kld_chunk = 512 if kld_dev is not None else 1024
+                        if self_check and my_idx == 0:
+                            self_kld, _ = tokenwise_kld_fp64(
+                                t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+                            )
+                            if float(self_kld.max().item()) != 0.0:
+                                raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
+                        kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
+                            t_logits,
+                            out_logits,
+                            token_ids[1:],
+                            chunk=kld_chunk,
+                            vocab_limit=vocab_limit,
+                            compute_device=kld_dev,
                         )
-                        if float(self_kld.max().item()) != 0.0:
-                            raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
-                        self_checked = True
-                    kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
-                        t_logits,
-                        out_logits,
-                        token_ids[1:],
-                        chunk=kld_chunk,
-                        vocab_limit=vocab_limit,
-                        compute_device=kld_dev,
-                    )
-                    klds.append(kld)
-                    agrees.append(agree)
-                    t_lps.append(t_lp)
-                    s_lps.append(s_lp)
-                    t_hits.append(hit)
-                    del t_logits
-                seq_len_win = int(token_ids.numel())
-                del ids, out_logits, rec
-                if seq_len_win >= 16384 and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                        local_payload = (my_idx, kld.cpu(), agree.cpu(), t_lp.cpu(), s_lp.cpu(), hit.cpu())
+                        del t_logits
+                    seq_len_win = int(token_ids.numel())
+                    del ids, out_logits, rec
+                    if seq_len_win >= 16384 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gathered: list[Any] | None = [None] * dp_world if is_writer else None
+                    dist.gather_object(local_payload, gathered, dst=0)
+                    if is_writer and gathered is not None:
+                        valid_items = [item for item in gathered if item is not None]
+                        valid_items.sort(key=lambda item: item[0])
+                        for _idx, kld_c, agree_c, t_lp_c, s_lp_c, hit_c in valid_items:
+                            klds.append(kld_c)
+                            agrees.append(agree_c)
+                            t_lps.append(t_lp_c)
+                            s_lps.append(s_lp_c)
+                            t_hits.append(hit_c)
+            else:
+                for p in split_paths:
+                    rec = None
+                    if is_writer or not dist.is_initialized():
+                        rec = torch.load(p, map_location="cpu", weights_only=True)
+                        token_ids = rec["token_ids"]
+                    else:
+                        token_ids = None
+                    if dist.is_initialized():
+                        obj = [token_ids]
+                        dist.broadcast_object_list(obj, src=0)
+                        token_ids = obj[0]
+                    assert token_ids is not None
+                    ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
+                    out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
+                    if is_writer:
+                        assert rec is not None
+                        t_logits = rec["logits"]
+                        kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
+                        kld_chunk = 512 if kld_dev is not None else 1024
+                        if self_check and not self_checked:
+                            self_kld, _ = tokenwise_kld_fp64(
+                                t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+                            )
+                            if float(self_kld.max().item()) != 0.0:
+                                raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
+                            self_checked = True
+                        kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
+                            t_logits,
+                            out_logits,
+                            token_ids[1:],
+                            chunk=kld_chunk,
+                            vocab_limit=vocab_limit,
+                            compute_device=kld_dev,
+                        )
+                        klds.append(kld)
+                        agrees.append(agree)
+                        t_lps.append(t_lp)
+                        s_lps.append(s_lp)
+                        t_hits.append(hit)
+                        del t_logits
+                    seq_len_win = int(token_ids.numel())
+                    del ids, out_logits, rec
+                    if seq_len_win >= 16384 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             if is_writer and klds:
                 summ = summarize_windows(
                     klds,
@@ -716,7 +772,7 @@ def main() -> None:
             print(f"[eval stock BF16 baseline @ 0.0M] loaded from {args.baseline_eval_json}", flush=True)
     elif eval_dir is not None and not args.resume:
         stock_baseline_eval = evaluate_dense_dir(
-            student, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+            student, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
         )
         if is_writer:
             print(f"[eval stock BF16 baseline @ 0.0M] {json.dumps(stock_baseline_eval)}", flush=True)
@@ -1012,9 +1068,15 @@ def main() -> None:
                     p_tail = (1.0 - top_logp.exp().sum(dim=-1)).clamp(0.0, 1.0)
 
             ctx = model_run.no_sync() if (use_ddp and micro + 1 < grad_accum) else torch.enable_grad()
+            seq_len_cur = int(ids.shape[1])
             offload_ctx = (
-                _offload_large_saved_tensors()
-                if (int(ids.shape[1]) >= 16384 and in_dev.type == "cuda")
+                _offload_large_saved_tensors(min_bytes=16 * 1024 * 1024)
+                if (seq_len_cur >= 32768 and in_dev.type == "cuda")
+                else nullcontext()
+            )
+            offload_bwd_ctx = (
+                _offload_large_saved_tensors(min_bytes=16 * 1024 * 1024)
+                if (seq_len_cur >= 65536 and in_dev.type == "cuda")
                 else nullcontext()
             )
             with ctx:
@@ -1050,20 +1112,43 @@ def main() -> None:
                         / grad_accum
                     )
                     del s_logits
-                loss.backward()
+                if seq_len_cur >= 32768 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                with offload_bwd_ctx:
+                    loss.backward()
                 acc_loss += float(loss.item())
                 del loss
 
         if use_ep_sync:
+            handles = []
+            small_cuda_grads: list[torch.Tensor] = []
             for p in trainable_params:
                 if p.grad is None:
                     p.grad = torch.zeros_like(p.data)
                 if p.grad.is_cuda:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    if p.grad.numel() >= 8_000_000:
+                        handles.append(dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True))
+                    else:
+                        small_cuda_grads.append(p.grad)
                 else:
                     g_gpu = p.grad.to(device=device)
                     dist.all_reduce(g_gpu, op=dist.ReduceOp.AVG)
                     p.grad.copy_(g_gpu.cpu())
+            if small_cuda_grads:
+                by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+                for g in small_cuda_grads:
+                    by_dtype.setdefault(g.dtype, []).append(g)
+                flat_jobs = []
+                for _dt, glist in by_dtype.items():
+                    flat = torch._utils._flatten_dense_tensors(glist)
+                    h = dist.all_reduce(flat, op=dist.ReduceOp.AVG, async_op=True)
+                    flat_jobs.append((h, flat, glist))
+                for h, flat, glist in flat_jobs:
+                    h.wait()
+                    for g, synced in zip(glist, torch._utils._unflatten_dense_tensors(flat, glist), strict=True):
+                        g.copy_(synced)
+            for h in handles:
+                h.wait()
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         opt.step()
         sched.step()
@@ -1076,11 +1161,18 @@ def main() -> None:
 
         seen = short_tokens_seen + long_tokens_seen
         seen_m = seen / 1e6
-        if is_writer and (step == 0 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
+        if is_writer and (step <= 2 or is_long or (step + 1) % 25 == 0 or step + 1 == total_steps):
+            vram_str = (
+                f" vram={torch.cuda.max_memory_allocated(device)/(1024**3):.1f}GiB"
+                if torch.cuda.is_available()
+                else ""
+            )
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
             print(
                 f"step={step+1}/{total_steps} split={phase} seq={int(step_ids.shape[1])} positions={seen_m:.2f}M "
                 f"(short={short_tokens_seen/1e6:.2f}M long={long_tokens_seen/1e6:.2f}M) "
-                f"loss={acc_loss:.4f} t={time.time()-t0:.1f}s",
+                f"loss={acc_loss:.4f}{vram_str} t={time.time()-t0:.1f}s",
                 flush=True,
             )
 
@@ -1095,7 +1187,9 @@ def main() -> None:
             m_tag = f"{milestones_m[next_milestone_idx]:.0f}m"
             _save_checkpoint(m_tag, step + 1)
             if eval_dir is not None:
-                m_eval = evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+                m_eval = evaluate_dense_dir(
+                    qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
+                )
                 if step + 1 == total_steps:
                     last_step_eval = m_eval
                 if is_writer:
@@ -1110,7 +1204,9 @@ def main() -> None:
         last_step_eval
         if last_step_eval is not None
         else (
-            evaluate_dense_dir(qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer)
+            evaluate_dense_dir(
+                qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
+            )
             if eval_dir is not None
             else None
         )
@@ -1127,19 +1223,19 @@ def main() -> None:
         # 1. Zero-sidecar merged carrier only (merged BF16 LoRA + stock BF16 norms, Engram disabled)
         qec.engram_enabled = False
         post_merge_carrier_only_eval = evaluate_dense_dir(
-            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
         )
         qec.engram_enabled = True
         # 2. Exact shipped BF16 artifact (stock BF16 norms + BF16 Engram projections + BF16 tables)
         bf16_bak = qec.quantize_engram_tables_inplace(torch.bfloat16, quantize_projections_bf16=True)
         post_merge_bf16_engram_eval = evaluate_dense_dir(
-            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
         )
         qec.restore_engram_tables(bf16_bak)
         # 3. Exact shipped FP8 artifact (stock BF16 norms + BF16 Engram projections + FP8 E4M3 tables)
         fp8_bak = qec.quantize_engram_tables_inplace(torch.float8_e4m3fn, quantize_projections_bf16=True)
         post_merge_fp8_engram_eval = evaluate_dense_dir(
-            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer
+            qec, eval_dir, vocab_limit=profile.vocab_size, is_writer=is_writer, dp_world=dp_world, dp_rank=dp_rank
         )
         qec.restore_engram_tables(fp8_bak)
         if is_writer:

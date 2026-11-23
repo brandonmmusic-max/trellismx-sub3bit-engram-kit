@@ -516,7 +516,7 @@ class DualTrellisEngramLayer(nn.Module):
         seq_len = int(hidden.shape[1])
         seq_chunk = 8192
 
-        if seq_len <= seq_chunk:
+        if seq_len <= 16384:
             y = self._pointwise_orders(hidden, e_uni, e_bi, e_tri, e_skip, route_weights_dense)
             if self.use_causal_conv and self.dw_conv is not None and self.conv_norm_scale is not None:
                 y = self._causal_conv_chunk(y, left_pad=3)

@@ -169,7 +169,8 @@ def _make_chunked_attention_forward(attn: nn.Module, q_chunk: int = 4096):
         drop_p = 0.0 if not attn.training else attn.attention_dropout
 
         use_ckpt = bool(
-            torch.is_grad_enabled()
+            seq_length >= 32768
+            and torch.is_grad_enabled()
             and (query_states.requires_grad or key_states.requires_grad or value_states.requires_grad)
         )
 
@@ -336,21 +337,21 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
         )
         ep_fwd = mod.forward
 
-        def _make_chunked_ep_dispatch(fn, max_tokens: int = 8192):
+        def _make_chunked_ep_dispatch(fn, passthrough_tokens: int = 16384, chunk_tokens: int = 8192):
             def _chunked_ep(
                 hidden_states: torch.Tensor,
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ):
                 n_tok = int(hidden_states.shape[0])
-                if n_tok <= max_tokens:
+                if n_tok <= passthrough_tokens:
                     return fn(hidden_states, top_k_index, top_k_weights)
-                use_ckpt = bool(torch.is_grad_enabled() and hidden_states.requires_grad)
+                use_ckpt = bool(n_tok >= 32768 and torch.is_grad_enabled() and hidden_states.requires_grad)
                 parts = []
-                for i in range(0, n_tok, max_tokens):
-                    h_c = hidden_states[i : i + max_tokens]
-                    idx_c = top_k_index[i : i + max_tokens]
-                    w_c = top_k_weights[i : i + max_tokens]
+                for i in range(0, n_tok, chunk_tokens):
+                    h_c = hidden_states[i : i + chunk_tokens]
+                    idx_c = top_k_index[i : i + chunk_tokens]
+                    w_c = top_k_weights[i : i + chunk_tokens]
                     if use_ckpt:
                         parts.append(
                             torch.utils.checkpoint.checkpoint(
@@ -363,7 +364,7 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
 
             return _chunked_ep
 
-        mod.forward = _make_chunked_ep_dispatch(ep_fwd, max_tokens=8192)  # type: ignore[method-assign]
+        mod.forward = _make_chunked_ep_dispatch(ep_fwd, passthrough_tokens=16384, chunk_tokens=8192)  # type: ignore[method-assign]
         patched += 1
     # Verify no non-expert parameter (especially lm_head or embed_tokens) remained TP-sharded.
     for pname, param in model.named_parameters():
