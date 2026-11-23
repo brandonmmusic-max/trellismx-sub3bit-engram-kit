@@ -296,6 +296,13 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
             ep_implementation="all_to_all",
         )
         patched += 1
+    # Verify no non-expert parameter (especially lm_head or embed_tokens) remained TP-sharded.
+    for pname, param in model.named_parameters():
+        if hasattr(param, "to_local") and ".experts." not in pname:
+            raise RuntimeError(
+                f"Non-expert parameter {pname!r} is still a sharded DTensor under DP+EP all_to_all; "
+                "pass tp_plan={'lm_head': 'replicate'} in DistributedConfig."
+            )
     return patched
 
 

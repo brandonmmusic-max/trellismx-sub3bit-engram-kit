@@ -107,13 +107,18 @@ def load_hf_model(
             cfg.text_config.base_model_tp_plan = None
         kwargs["config"] = cfg
         try:
-            kwargs["distributed_config"] = DistributedConfig(
-                ep_size=world_size,
-                tp_size=world_size,
-                fsdp_size=1,
-                pp_size=1,
-                ep_implementation="all_reduce",
-            )
+            dist_kwargs: dict[str, object] = {
+                "ep_size": world_size,
+                "tp_size": world_size,
+                "fsdp_size": 1,
+                "pp_size": 1,
+                "ep_implementation": "all_reduce",
+            }
+            if ep_implementation == "all_to_all":
+                # Override class-level _tp_plan={'lm_head': 'colwise_gather_output'} so every rank
+                # keeps a full independent lm_head with zero cross-rank logit gathering.
+                dist_kwargs["tp_plan"] = {"lm_head": "replicate"}
+            kwargs["distributed_config"] = DistributedConfig(**dist_kwargs)
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
@@ -319,14 +324,31 @@ def dump_sparse_split(
                 lse_buf.append(loc_lse)
 
         if is_writer:
+            tok_cat = torch.cat(ids_buf, dim=0).contiguous()
+            idx_cat = torch.cat(idx_buf, dim=0).contiguous()
+            logp_cat = torch.cat(logp_buf, dim=0).contiguous()
+            ptail_cat = torch.cat(ptail_buf, dim=0).contiguous()
+            lse_cat = torch.cat(lse_buf, dim=0).contiguous()
+            # Verify next-token alignment on every rank's slice before committing the shard to disk.
+            next_tok = tok_cat[:, 1:]
+            row_hits = (idx_cat[:, :, 0] == next_tok).float().mean(dim=-1)
+            mean_hit = float(row_hits.mean().item())
+            if use_dp_gather and int(row_hits.shape[0]) >= dp_world * batch_size:
+                for r in range(dp_world):
+                    r_hit = float(row_hits[r * batch_size : (r + 1) * batch_size].mean().item())
+                    if r_hit < 0.15:
+                        raise RuntimeError(
+                            f"DP+EP alignment canary failed on {out_path.name} rank {r}: "
+                            f"top1_hit={r_hit:.4f} (overall={mean_hit:.4f})"
+                        )
             tmp_path = out_path.with_suffix(".pt.tmp")
             torch.save(
                 {
-                    "token_ids": torch.cat(ids_buf, dim=0).contiguous(),
-                    "top_idx": torch.cat(idx_buf, dim=0).contiguous(),
-                    "top_logp": torch.cat(logp_buf, dim=0).contiguous(),
-                    "p_tail": torch.cat(ptail_buf, dim=0).contiguous(),
-                    "logsumexp": torch.cat(lse_buf, dim=0).contiguous(),
+                    "token_ids": tok_cat,
+                    "top_idx": idx_cat,
+                    "top_logp": logp_cat,
+                    "p_tail": ptail_cat,
+                    "logsumexp": lse_cat,
                 },
                 tmp_path,
             )
@@ -335,7 +357,7 @@ def dump_sparse_split(
             rate = new_positions / max(1e-6, time.time() - t0)
             print(
                 f"[{out_dir.name}] shard={cur_shard}/{shard_id} worker={shard_rank}/{shard_world} "
-                f"rows={shard_end}/{n_rows} rate={rate:.0f} pos/s",
+                f"rows={shard_end}/{n_rows} top1_hit={mean_hit:.4f} rate={rate:.0f} pos/s",
                 flush=True,
             )
 

@@ -240,13 +240,16 @@ def _load_model(
             cfg.text_config.base_model_tp_plan = None
         kwargs["config"] = cfg
         try:
-            kwargs["distributed_config"] = DistributedConfig(
-                ep_size=world_size,
-                tp_size=world_size,
-                fsdp_size=1,
-                pp_size=1,
-                ep_implementation="all_reduce",
-            )
+            dist_kwargs: dict[str, object] = {
+                "ep_size": world_size,
+                "tp_size": world_size,
+                "fsdp_size": 1,
+                "pp_size": 1,
+                "ep_implementation": "all_reduce",
+            }
+            if ep_implementation == "all_to_all":
+                dist_kwargs["tp_plan"] = {"lm_head": "replicate"}
+            kwargs["distributed_config"] = DistributedConfig(**dist_kwargs)
         except TypeError:
             kwargs["distributed_config"] = DistributedConfig(
                 tp_size=world_size,
