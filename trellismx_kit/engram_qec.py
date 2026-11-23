@@ -448,15 +448,17 @@ class DualTrellisEngramLayer(nn.Module):
         v = F.linear(e_f, wv.weight.float()).view(bsz, seq_len, self.gate_groups, self.group_dim)
         return (alpha * v).reshape(bsz, seq_len, hdim)
 
-    def forward(
+    def _pointwise_orders(
         self,
-        hidden: torch.Tensor,
-        bank_out: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None],
-        route_weights_dense: torch.Tensor | None = None,
+        h_c: torch.Tensor,
+        e_uni_c: torch.Tensor,
+        e_bi_c: torch.Tensor | None,
+        e_tri_c: torch.Tensor | None,
+        e_skip_c: torch.Tensor | None,
+        rw_c: torch.Tensor | None,
     ) -> torch.Tensor:
-        e_uni, e_bi, e_tri, e_skip = bank_out
         dev = self.h_scale.device
-        h_f = hidden.to(device=dev, dtype=torch.float32)
+        h_f = h_c.to(device=dev, dtype=torch.float32)
         bsz, seq_len, hdim = h_f.shape
         h_norm = (
             h_f
@@ -466,35 +468,97 @@ class DualTrellisEngramLayer(nn.Module):
         h_norm_g = h_norm.view(bsz, seq_len, self.gate_groups, self.group_dim)
 
         route_bonus = None
-        if self.route_gate_w is not None and route_weights_dense is not None:
-            rw = route_weights_dense.to(device=dev, dtype=torch.float32)
+        if self.route_gate_w is not None and rw_c is not None:
+            rw = rw_c.to(device=dev, dtype=torch.float32)
             route_bonus = torch.matmul(rw, self.route_gate_w.float().t())
 
-        y = self._gate_and_apply(h_norm_g, e_uni, self.w_k_uni, self.w_v_uni, 0, route_bonus)
+        y = self._gate_and_apply(h_norm_g, e_uni_c, self.w_k_uni, self.w_v_uni, 0, route_bonus)
         assert y is not None
         for idx, (e, wk, wv) in enumerate(
             (
-                (e_bi, self.w_k_bi, self.w_v_bi),
-                (e_tri, self.w_k_tri, self.w_v_tri),
-                (e_skip, self.w_k_skip, self.w_v_skip),
+                (e_bi_c, self.w_k_bi, self.w_v_bi),
+                (e_tri_c, self.w_k_tri, self.w_v_tri),
+                (e_skip_c, self.w_k_skip, self.w_v_skip),
             ),
             start=1,
         ):
             term = self._gate_and_apply(h_norm_g, e, wk, wv, idx, route_bonus)
             if term is not None:
                 y = y + term
+        return y
+
+    def _causal_conv_chunk(self, y_win: torch.Tensor, left_pad: int) -> torch.Tensor:
+        assert self.dw_conv is not None and self.conv_norm_scale is not None
+        hdim = self.hidden_size
+        y_norm = (
+            y_win
+            * torch.rsqrt(y_win.square().mean(dim=-1, keepdim=True) + 1e-6)
+            * self.conv_norm_scale.float()
+        )
+        if left_pad > 0:
+            y_pad = F.pad(y_norm.transpose(1, 2), (left_pad, 0))
+            y_center = y_win
+        else:
+            y_pad = y_norm.transpose(1, 2)
+            y_center = y_win[:, 3:, :]
+        conv_out = F.silu(
+            F.conv1d(y_pad, self.dw_conv.weight.float(), groups=hdim).transpose(1, 2)
+        )
+        return y_center + conv_out
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        bank_out: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None],
+        route_weights_dense: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        e_uni, e_bi, e_tri, e_skip = bank_out
+        seq_len = int(hidden.shape[1])
+        seq_chunk = 8192
+
+        if seq_len <= seq_chunk:
+            y = self._pointwise_orders(hidden, e_uni, e_bi, e_tri, e_skip, route_weights_dense)
+            if self.use_causal_conv and self.dw_conv is not None and self.conv_norm_scale is not None:
+                y = self._causal_conv_chunk(y, left_pad=3)
+            return y.to(device=hidden.device, dtype=hidden.dtype)
+
+        use_ckpt = bool(torch.is_grad_enabled())
+        y_parts: list[torch.Tensor] = []
+        for t0 in range(0, seq_len, seq_chunk):
+            t1 = min(seq_len, t0 + seq_chunk)
+            h_c = hidden[:, t0:t1]
+            eu_c = e_uni[:, t0:t1]
+            eb_c = e_bi[:, t0:t1] if e_bi is not None else None
+            et_c = e_tri[:, t0:t1] if e_tri is not None else None
+            es_c = e_skip[:, t0:t1] if e_skip is not None else None
+            rw_c = route_weights_dense[:, t0:t1] if route_weights_dense is not None else None
+            if use_ckpt:
+                y_c = _grad_checkpoint(
+                    self._pointwise_orders, h_c, eu_c, eb_c, et_c, es_c, rw_c, use_reentrant=False
+                )
+            else:
+                y_c = self._pointwise_orders(h_c, eu_c, eb_c, et_c, es_c, rw_c)
+            y_parts.append(y_c)
+        y = torch.cat(y_parts, dim=1)
 
         if self.use_causal_conv and self.dw_conv is not None and self.conv_norm_scale is not None:
-            y_norm = (
-                y
-                * torch.rsqrt(y.square().mean(dim=-1, keepdim=True) + 1e-6)
-                * self.conv_norm_scale.float()
-            )
-            y_pad = F.pad(y_norm.transpose(1, 2), (3, 0))
-            conv_out = F.silu(
-                F.conv1d(y_pad, self.dw_conv.weight.float(), groups=hdim).transpose(1, 2)
-            )
-            y = y + conv_out
+            conv_parts: list[torch.Tensor] = []
+            for t0 in range(0, seq_len, seq_chunk):
+                t1 = min(seq_len, t0 + seq_chunk)
+                if t0 == 0:
+                    y_win = y[:, 0:t1]
+                    lpad = 3
+                else:
+                    y_win = y[:, t0 - 3 : t1]
+                    lpad = 0
+                if use_ckpt:
+                    c_out = _grad_checkpoint(
+                        self._causal_conv_chunk, y_win, lpad, use_reentrant=False
+                    )
+                else:
+                    c_out = self._causal_conv_chunk(y_win, lpad)
+                conv_parts.append(c_out)
+            y = torch.cat(conv_parts, dim=1)
 
         return y.to(device=hidden.device, dtype=hidden.dtype)
 
