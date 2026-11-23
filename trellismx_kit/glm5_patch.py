@@ -321,14 +321,20 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
                 n_tok = int(hidden_states.shape[0])
                 if n_tok <= max_tokens:
                     return fn(hidden_states, top_k_index, top_k_weights)
-                parts = [
-                    fn(
-                        hidden_states[i : i + max_tokens],
-                        top_k_index[i : i + max_tokens],
-                        top_k_weights[i : i + max_tokens],
-                    )
-                    for i in range(0, n_tok, max_tokens)
-                ]
+                use_ckpt = bool(torch.is_grad_enabled() and hidden_states.requires_grad)
+                parts = []
+                for i in range(0, n_tok, max_tokens):
+                    h_c = hidden_states[i : i + max_tokens]
+                    idx_c = top_k_index[i : i + max_tokens]
+                    w_c = top_k_weights[i : i + max_tokens]
+                    if use_ckpt:
+                        parts.append(
+                            torch.utils.checkpoint.checkpoint(
+                                fn, h_c, idx_c, w_c, use_reentrant=False
+                            )
+                        )
+                    else:
+                        parts.append(fn(h_c, idx_c, w_c))
                 return torch.cat(parts, dim=0)
 
             return _chunked_ep
