@@ -406,6 +406,97 @@ def _install_per_expert_release(
         )
 
 
+def _score_eval_window(
+    eval_model: torch.nn.Module,
+    ids: torch.Tensor,
+    token_ids: torch.Tensor,
+    t_logits: torch.Tensor | None,
+    *,
+    need_score: bool,
+    run_self_check: bool,
+    window_name: str,
+    vocab_limit: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Run one batch_size=1 eval window; chunk lm_head on >=16K sequences to avoid 57 GiB logit peaks."""
+    seq_len = int(ids.shape[1])
+    can_chunk_lm = (
+        seq_len >= 16384
+        and isinstance(eval_model, FullStackQEC)
+        and hasattr(eval_model.model, "model")
+        and hasattr(eval_model.model, "lm_head")
+    )
+    if can_chunk_lm:
+        hidden = eval_model.forward_hidden(input_ids=ids, use_cache=False)
+        assert hidden is not None
+        hidden_s = hidden[0, :-1]
+        del hidden
+        if not need_score:
+            del hidden_s
+            return None
+        assert t_logits is not None
+        kld_dev = hidden_s.device if hidden_s.device.type == "cuda" else None
+        kld_chunk = 512 if kld_dev is not None else 1024
+        if run_self_check:
+            self_kld, _ = tokenwise_kld_fp64(
+                t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+            )
+            if float(self_kld.max().item()) != 0.0:
+                raise RuntimeError(f"teacher self-KLD canary failed on {window_name}: {self_kld.max().item()}")
+        n_pos = int(hidden_s.shape[0])
+        lm_head = eval_model.model.lm_head
+        k_parts, a_parts, tl_parts, sl_parts, h_parts = [], [], [], [], []
+        targets = token_ids[1:]
+        for c0 in range(0, n_pos, kld_chunk):
+            c1 = min(n_pos, c0 + kld_chunk)
+            s_chunk = lm_head(hidden_s[c0:c1])
+            kc, ac, tlc, slc, hc = tokenwise_kld_and_alignment_fp64(
+                t_logits[c0:c1],
+                s_chunk,
+                targets[c0:c1],
+                chunk=kld_chunk,
+                vocab_limit=vocab_limit,
+                compute_device=kld_dev,
+            )
+            k_parts.append(kc)
+            a_parts.append(ac)
+            tl_parts.append(tlc)
+            sl_parts.append(slc)
+            h_parts.append(hc)
+            del s_chunk
+        del hidden_s
+        return (
+            torch.cat(k_parts, dim=0),
+            torch.cat(a_parts, dim=0),
+            torch.cat(tl_parts, dim=0),
+            torch.cat(sl_parts, dim=0),
+            torch.cat(h_parts, dim=0),
+        )
+
+    out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
+    if not need_score:
+        del out_logits
+        return None
+    assert t_logits is not None
+    kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
+    kld_chunk = 512 if kld_dev is not None else 1024
+    if run_self_check:
+        self_kld, _ = tokenwise_kld_fp64(
+            t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
+        )
+        if float(self_kld.max().item()) != 0.0:
+            raise RuntimeError(f"teacher self-KLD canary failed on {window_name}: {self_kld.max().item()}")
+    res = tokenwise_kld_and_alignment_fp64(
+        t_logits,
+        out_logits,
+        token_ids[1:],
+        chunk=kld_chunk,
+        vocab_limit=vocab_limit,
+        compute_device=kld_dev,
+    )
+    del out_logits
+    return res
+
+
 @torch.no_grad()
 def evaluate_dense_dir(
     eval_model: torch.nn.Module,
@@ -460,30 +551,23 @@ def evaluate_dense_dir(
                     rec = torch.load(p, map_location="cpu", weights_only=True)
                     token_ids = rec["token_ids"]
                     ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-                    out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
+                    t_logits = rec["logits"] if is_real else None
+                    scored = _score_eval_window(
+                        eval_model,
+                        ids,
+                        token_ids,
+                        t_logits,
+                        need_score=is_real,
+                        run_self_check=bool(self_check and my_idx == 0),
+                        window_name=p.name,
+                        vocab_limit=vocab_limit,
+                    )
                     local_payload = None
-                    if is_real:
-                        t_logits = rec["logits"]
-                        kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
-                        kld_chunk = 512 if kld_dev is not None else 1024
-                        if self_check and my_idx == 0:
-                            self_kld, _ = tokenwise_kld_fp64(
-                                t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
-                            )
-                            if float(self_kld.max().item()) != 0.0:
-                                raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
-                        kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
-                            t_logits,
-                            out_logits,
-                            token_ids[1:],
-                            chunk=kld_chunk,
-                            vocab_limit=vocab_limit,
-                            compute_device=kld_dev,
-                        )
+                    if is_real and scored is not None:
+                        kld, agree, t_lp, s_lp, hit = scored
                         local_payload = (my_idx, kld.cpu(), agree.cpu(), t_lp.cpu(), s_lp.cpu(), hit.cpu())
-                        del t_logits
                     seq_len_win = int(token_ids.numel())
-                    del ids, out_logits, rec
+                    del ids, t_logits, rec, scored
                     if seq_len_win >= 16384 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     gathered: list[Any] | None = [None] * dp_world if is_writer else None
@@ -511,35 +595,28 @@ def evaluate_dense_dir(
                         token_ids = obj[0]
                     assert token_ids is not None
                     ids = token_ids.unsqueeze(0).to(device=dev, dtype=torch.long)
-                    out_logits = eval_model(input_ids=ids, use_cache=False).logits[0, :-1]
-                    if is_writer:
-                        assert rec is not None
-                        t_logits = rec["logits"]
-                        kld_dev = out_logits.device if out_logits.device.type == "cuda" else None
-                        kld_chunk = 512 if kld_dev is not None else 1024
-                        if self_check and not self_checked:
-                            self_kld, _ = tokenwise_kld_fp64(
-                                t_logits, t_logits, chunk=kld_chunk, vocab_limit=vocab_limit, compute_device=kld_dev
-                            )
-                            if float(self_kld.max().item()) != 0.0:
-                                raise RuntimeError(f"teacher self-KLD canary failed on {p.name}: {self_kld.max().item()}")
+                    t_logits = rec["logits"] if (is_writer and rec is not None) else None
+                    scored = _score_eval_window(
+                        eval_model,
+                        ids,
+                        token_ids,
+                        t_logits,
+                        need_score=is_writer,
+                        run_self_check=bool(self_check and not self_checked),
+                        window_name=p.name,
+                        vocab_limit=vocab_limit,
+                    )
+                    if is_writer and scored is not None:
+                        if self_check:
                             self_checked = True
-                        kld, agree, t_lp, s_lp, hit = tokenwise_kld_and_alignment_fp64(
-                            t_logits,
-                            out_logits,
-                            token_ids[1:],
-                            chunk=kld_chunk,
-                            vocab_limit=vocab_limit,
-                            compute_device=kld_dev,
-                        )
+                        kld, agree, t_lp, s_lp, hit = scored
                         klds.append(kld)
                         agrees.append(agree)
                         t_lps.append(t_lp)
                         s_lps.append(s_lp)
                         t_hits.append(hit)
-                        del t_logits
                     seq_len_win = int(token_ids.numel())
-                    del ids, out_logits, rec
+                    del ids, t_logits, rec, scored
                     if seq_len_win >= 16384 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
             if is_writer and klds:
@@ -644,6 +721,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engram-table-device", choices=("auto", "cpu"), default="auto")
     parser.add_argument("--canon-tokenizer", default="", help="Tokenizer path for NFKC canonicalization LUT (defaults to --student-model)")
     parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=float, default=64.0)
+    parser.add_argument("--lr-emb", type=float, default=1.5e-3)
+    parser.add_argument("--lr-proj", type=float, default=4e-4)
+    parser.add_argument("--lr-lora", type=float, default=2.5e-4)
+    parser.add_argument("--lr-norm", type=float, default=3e-4)
     parser.add_argument("--train-dense-lora", action="store_true")
     parser.add_argument("--train-shared-lora", action="store_true")
     parser.add_argument("--train-lm-head-lora", action="store_true")
@@ -839,6 +921,7 @@ def main() -> None:
         engram_bank_groups=bank_groups,
         engram_hook_target=args.engram_hook_target,
         lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         engram_kwargs=ek,
         train_norms=True,
         train_dense_lora=args.train_dense_lora,
@@ -876,7 +959,12 @@ def main() -> None:
     use_ddp = distributed and (not args.device_map_auto) and (not args.distributed_ep) and (table_dev is None)
     use_ep_sync = distributed and args.distributed_ep
     model_run: torch.nn.Module = DDP(qec, device_ids=[local_rank]) if use_ddp else qec
-    param_groups = qec.parameter_groups()
+    param_groups = qec.parameter_groups(
+        lr_emb=args.lr_emb,
+        lr_proj=args.lr_proj,
+        lr_lora=args.lr_lora,
+        lr_norm=args.lr_norm,
+    )
     trainable_params = [p for g in param_groups for p in g["params"]]
 
     def _sync_ep_qec_params() -> None:
