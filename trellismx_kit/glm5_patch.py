@@ -287,7 +287,22 @@ def patch_ep_dp_all_to_all(model: nn.Module) -> int:
         if isinstance(orig_impl, AllToAllEP) and orig_impl.tp_mesh.size() == 1:
             patched += 1
             continue
-        mod.forward = orig_impl.experts_forward  # type: ignore[method-assign]
+        base_experts_fwd = orig_impl.experts_forward
+
+        def _make_chunked_local_experts(fn, max_rows: int = 65536):
+            def _chunked(hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
+                n_rows = int(hidden_states.shape[0])
+                if n_rows <= max_rows:
+                    return fn(hidden_states, top_k_index, top_k_weights)
+                parts = [
+                    fn(hidden_states[i : i + max_rows], top_k_index[i : i + max_rows], top_k_weights[i : i + max_rows])
+                    for i in range(0, n_rows, max_rows)
+                ]
+                return torch.cat(parts, dim=0)
+
+            return _chunked
+
+        mod.forward = _make_chunked_local_experts(base_experts_fwd)  # type: ignore[method-assign]
         parallel = orig_parallel if orig_parallel is not None else EpDispatchExpertsParallel()
         parallel.install_forward(
             mod,
